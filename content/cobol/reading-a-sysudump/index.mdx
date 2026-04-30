@@ -1,0 +1,411 @@
+---
+module: abends
+order: 2
+title: Reading a SYSUDUMP
+summary: The structure of a SYSUDUMP — title, PSW, registers, traceback, storage. Locating the failing instruction, mapping it back to the compile listing, reading the bytes of the field that caused the ABEND.
+estimatedMinutes: 32
+prerequisites: [hello-world, divisions, pic-and-comp3, anatomy-of-an-abend]
+objectives:
+  - Recognise the major sections of a SYSUDUMP and where each lives.
+  - Read a PSW and extract the failing instruction's address.
+  - Locate that address in a compile listing and identify the source line.
+  - Read the bytes of a packed-decimal or zoned field from the dump's storage area.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: 'What does the rightmost (low-order) 4 bytes of a 64-bit PSW contain at the moment of an ABEND?'
+      options:
+        - { id: a, label: "The address of the next instruction to execute — which is the instruction AFTER the failing one (PSW has already advanced past it on a program check).", correct: true, explanation: "The PSW always points at the NEXT instruction, not the failing one. To find the failing instruction, you look at the few bytes BEFORE the PSW address. Most failed instructions are 4 or 6 bytes; you back up and decode." }
+        - { id: b, label: "The exact byte address of the failing instruction." }
+        - { id: c, label: "A status flag indicating the type of exception." }
+        - { id: d, label: "A reserved zero-padded field." }
+    - prompt: A SYSUDUMP shows PSW=078D1000_004C8B72 and the program's CSECT (load module) base address is 004C8000. Where in the program did the ABEND occur (relative to CSECT base)?
+      options:
+        - { id: a, label: "Offset X'B72' (PSW low half minus CSECT base).", correct: true, explanation: "X'004C8B72' - X'004C8000' = X'B72'. You then look up offset X'B72' in the compile listing's procedure-division offset map; the listing tells you which COBOL line that translates to." }
+        - { id: b, label: "Offset X'4C8B72' from the program's start." }
+        - { id: c, label: "Offset X'1000' from the program's start." }
+        - { id: d, label: "There's no way to tell without the linkage editor map." }
+    - prompt: The compile listing's offset map shows offsets like '000B70 ZAP a,b' near the failing PSW. What COBOL verb does ZAP correspond to?
+      options:
+        - { id: a, label: "ZAP is 'Zero and Add Packed' — an arithmetic instruction emitted for COMPUTE / MOVE / ADD on packed-decimal fields. The offending verb is moving or adding into a packed target.", correct: true, explanation: "ZAP, AP, SP, MP, DP are the packed-decimal hardware instructions. Seeing one of these near a PSW means the failure is in numeric arithmetic on a packed field. ZAP specifically is 'set target = source' for packed values; it fails if either operand has a bad sign nibble." }
+        - { id: b, label: "ZAP is the assembler mnemonic for unconditional branch." }
+        - { id: c, label: "ZAP marks the end of a paragraph." }
+        - { id: d, label: "ZAP is unrelated to COBOL — it's a CICS macro." }
+    - prompt: 'Looking at storage in a dump: a 5-byte field at address X''00510234'' holds the bytes "20 25 31 03 00". This is declared as PIC S9(7)V99 COMP-3. What is wrong with it?'
+      options:
+        - { id: a, label: "The last byte's low nibble is X'0', which is not a valid sign nibble (C, D, or F). Any arithmetic on this field produces S0C7.", correct: true, explanation: "Valid sign nibbles are C (positive), D (negative), F (unsigned). X'0' is invalid. A field with bytes ending in something other than C, D, or F is the canonical 'uninitialized COMP-3' bug pattern." }
+        - { id: b, label: "Nothing — the field has a valid value of 2025310300." }
+        - { id: c, label: "The first byte should be X'00' for a value that small." }
+        - { id: d, label: "The field is too short to hold S9(7)V99 — it should be 6 bytes." }
+    - prompt: 'In a CEEDUMP, what is the "Traceback" section showing?'
+      options:
+        - { id: a, label: "The chain of CALL invocations leading to the failing program — each entry shows program name, source statement number, and offset.", correct: true, explanation: "The traceback is a CALL stack: top entry is the program that ABENDed; below it are the programs that CALLed each other to get there. For programs that aren't deeply nested it's short. For CICS or LINK-heavy code it can be many frames deep." }
+        - { id: b, label: "A list of every dataset opened during the run." }
+        - { id: c, label: "A timeline of CPU usage." }
+        - { id: d, label: "A history of the last 100 SQL statements." }
+---
+
+# Reading a SYSUDUMP
+
+The job ABENDed with `S0C7`. You opened SDSF, found the failed step,
+and the JESYSMSG points at a `SYSUDUMP` dataset. You browse it. The
+first thing you see is some 80-column lines of hexadecimal that look
+like nothing at all. Welcome to the maintainer's daily reality.
+
+This lesson is about turning that wall of hex into a single line of
+COBOL source code. The skill is mostly mechanical — find the PSW,
+subtract a base, look up an offset, read the listing — but it does not
+get taught anywhere except on the job, which is why most maintainers
+remain afraid of dumps for years longer than they need to.
+
+## Three flavors of dump
+
+When a program ABENDs, one of three dump formats lands in your spool.
+Knowing which is which saves time:
+
+| Dump          | Provided by | Best for                                              |
+| ------------- | ----------- | ----------------------------------------------------- |
+| `SYSUDUMP`    | OS          | Compact snapshot — the failing program's address spaces, plus key control blocks. The most common in batch JCL. |
+| `SYSABEND`    | OS          | Larger version of `SYSUDUMP` — more storage included. Use when you need to see far-away storage. |
+| `CEEDUMP`     | Language Environment | Formatted, source-line-aware dump for COBOL/PL/I. Easier to read than `SYSUDUMP` if your program is LE-enabled. |
+
+In practice: most modern batch programs run under LE and produce both
+a `CEEDUMP` and (if the JCL allocates one) a `SYSUDUMP`. **Always read
+the `CEEDUMP` first** — it pre-formats the diagnostics into something
+human-readable. Only fall back to `SYSUDUMP` if the `CEEDUMP` is missing
+or you need raw storage to inspect.
+
+The JCL DD statements look like:
+
+```jcl
+//SYSUDUMP DD  SYSOUT=*
+//CEEDUMP  DD  SYSOUT=*
+//SYSABEND DD  SYSOUT=*
+```
+
+If a dataset is allocated to one of these DDs, that is where the
+formatted dump goes. Your shop's standard JCL almost certainly already
+allocates them.
+
+## The shape of a SYSUDUMP
+
+A raw `SYSUDUMP` is roughly:
+
+```
+*** TITLE BLOCK ***       <- ABEND code, time, jobname
+*** PSW AT ABEND ***      <- the program status word
+*** REGISTERS ***         <- R0-R15 at the moment of failure
+*** TRACEBACK ***         <- CALL chain (in newer dumps)
+*** SAVE AREA TRACE ***   <- the linkage save areas, oldest to newest
+*** STORAGE ***           <- pages of memory around the failing address
+```
+
+The same regions appear in a `CEEDUMP` with friendlier labels. The
+order varies slightly by IBM release. The diagnostics process is
+always the same: read the title, read the PSW, look up the failing
+instruction in the listing, look at the failing field's bytes.
+
+## The PSW — the failing instruction
+
+The Program Status Word is a 64-bit (or 128-bit on z/Architecture)
+register that holds the CPU's current state, including the address of
+the **next instruction to execute**.
+
+A typical SYSUDUMP entry:
+
+```
+PSW AT ENTRY TO ABEND  078D1000 004C8B78
+```
+
+The first 4 bytes (`078D1000`) are flags and mode; you can ignore them
+for diagnostics. The second 4 bytes (`004C8B78`) are the instruction
+address — the **next** instruction the CPU was about to run.
+
+<Callout kind="warn" title="The PSW is one instruction past the failure">
+
+A program-check exception (the `0Cx` family) is raised by the CPU
+**after** it has decoded an instruction and decided it cannot complete
+it. The PSW has already advanced to the next instruction's address.
+
+To find the actual failing instruction, you back up: the previous
+instruction is the failing one. Most COBOL-emitted instructions are 4
+or 6 bytes long. So if PSW is `004C8B78`, the failing instruction is at
+`004C8B72` or `004C8B74` (4 or 6 bytes earlier). The compile listing's
+offset map will tell you the exact position.
+
+</Callout>
+
+## The compile listing — your decoder ring
+
+When a COBOL program is compiled, the compiler can produce a listing
+that includes the procedure-division offset map. This is opt-in via the
+`LIST` and `OFFSET` (or `MAP`) compile options:
+
+```
+PP 5650-COB1 V6.4 IBM Enterprise COBOL for z/OS  CUSTBL01
+
+PROCEDURE DIVISION REFERENCES BY VERB
+SOURCE   COMPILER-GENERATED
+LINE     OFFSET   VERB        OPERAND
+   34    000A40   PERFORM     READ-CUSTOMER-FILE
+   35    000A48   READ        CUSTOMER-FILE
+   36    000A60   IF          CUSTOMER-EOF = 'Y'
+   ...
+   78    000B68   COMPUTE     RUNNING-TOTAL ROUNDED = ...
+   78    000B70   ZAP         WS-WORKSPACE,WS-LINE-AMOUNT
+   78    000B78   AP          WS-RUNNING-TOTAL,WS-WORKSPACE
+   ...
+```
+
+The `OFFSET` column is the byte offset within the program's CSECT (the
+load module's main entry). The `VERB` column tells you the
+compiler-generated machine instruction. The `LINE` column is the COBOL
+source line number.
+
+**The mapping process:**
+
+1. Read the PSW: e.g., `004C8B78`.
+2. Find the program's CSECT base address. This is usually in a
+   `LINKAGE EDITOR` map at the top of the dump, or in the
+   `Module Map` section of a CEEDUMP. Suppose it's `004C8000`.
+3. Subtract: `004C8B78 - 004C8000 = 0B78`.
+4. The PSW points one instruction past the failure, so the failing
+   offset is `0B70` or `0B72` (back up by 4 or 6 bytes).
+5. Look up `0B70` in the compile listing. The line above shows
+   `0B70 ZAP WS-WORKSPACE,WS-LINE-AMOUNT` on COBOL source line 78.
+6. Source line 78 is `COMPUTE RUNNING-TOTAL ROUNDED = ...`.
+
+That is the failing statement. Now you know **where** the program
+faulted; you still need to figure out **why**.
+
+## Reading the failing field's bytes
+
+For an S0C7, the operands of the failing decimal instruction are the
+two fields. The dump's storage section shows you their bytes.
+
+```
+STORAGE AT ENTRY TO ABEND
+00510200   00000000 00000000 12345678 9C000000   *................*
+00510210   40404040 40404040 00000000 00000000   *        ........*
+00510220   00000000 00000000 20253103 00000000   *.........%......*
+00510230   00000000 00000000 00000000 00000000   *................*
+```
+
+Each line is a 16-byte block; the address on the left is the start of
+that block; the hex in the middle is the bytes; the EBCDIC translation
+on the right (with dots for non-printable) is a sanity check. (`40` is
+EBCDIC space.)
+
+Looking up the operand addresses from the failing `ZAP`:
+
+- `WS-LINE-AMOUNT` lives at `00510208` (per the listing or the symbol
+  map). Its bytes are `12 34 56 78 9C` — packed `+12345678.9` — valid.
+- `WS-WORKSPACE` is at `00510228`, 5 bytes: `20 25 31 03 00`.
+
+That last byte is `00`. The low nibble is `0` — not a valid sign nibble
+(`C`, `D`, or `F`). The `ZAP` instruction fails on the bad sign nibble
+in the target.
+
+Conclusion: `WS-WORKSPACE` is **uninitialized**. Some path through the
+program reaches the COMPUTE without first setting `WS-WORKSPACE`. The
+fix is either to `INITIALIZE WS-WORKSPACE TO ZERO` at the start of the
+paragraph, or to find the path that skips the initialisation.
+
+This is the canonical S0C7. Once you have done it three or four times
+the muscle memory is permanent.
+
+## The traceback — how did we get here?
+
+The traceback (or "Save Area Trace") is the CALL chain. In a CEEDUMP
+it is formatted readably:
+
+```
+Traceback:
+   DSA Addr Program Unit  Entry      Statement   Load Mod    Service
+   00510A00 CUSTBL01      CUSTBL01            78 CUSTBL01    LE6500
+   005107A0 BATCHDR        BATCHDR            42 BATCHDR     LE6500
+   00510700 CEEBINIT      CEEBINIT             0 CEEPLPKA    HLE7790
+```
+
+Read it bottom-up: `CEEBINIT` invoked `BATCHDR`'s entry point at
+statement 42 (the `CALL`), which invoked `CUSTBL01`'s entry, which
+ABENDed at statement 78. The "DSA Addr" is the dynamic save area for
+each frame (used to find local variables; rarely needed for routine
+diagnosis).
+
+For a non-CALLing program the traceback is one entry — the failing
+program itself. For a CICS or batch program with deep CALLs, the
+traceback tells you who handed off responsibility, which is critical
+when the actual failure is in a copybook or a shared CALLed module.
+
+## A minimal worked dump
+
+Suppose the SYSUDUMP shows:
+
+```
+*** TITLE BLOCK
+JOBNAME    BATCH001
+STEPNAME   STEP010
+PROC STEP  RUNJOB
+ABEND CODE S0C7
+
+*** PSW AT ENTRY TO ABEND
+078D1000 004C8B78  REASON=00000000
+
+*** MODULE MAP
+LOADMOD    CSECT    BASE       LENGTH
+CUSTBL01   CUSTBL01 004C8000   00001500
+
+*** STORAGE AT 00510200
+00510200   00000000 00000000 12345678 9C404040   *...........{    *
+00510210   40404040 40404040 00000000 00000000   *        ........*
+00510220   00000000 00000000 20253103 00000000   *.........%......*
+```
+
+Procedure:
+
+1. PSW addr = `004C8B78`. CSECT base = `004C8000`. Offset = `0B78`.
+2. Listing shows `0B70 ZAP WS-WORKSPACE,WS-LINE-AMOUNT` (source line 78).
+3. The failing instruction is the ZAP at offset `0B70`.
+4. Operands: `WS-LINE-AMOUNT` at `0051020C` is `12 34 56 78 9C` — valid.
+5. `WS-WORKSPACE` at `00510228` is `20 25 31 03 00` — last byte `00`,
+   invalid sign nibble.
+6. Read source line 78. Identify the path that reaches this line
+   without initialising `WS-WORKSPACE`.
+7. Fix: add `MOVE ZERO TO WS-WORKSPACE` or `INITIALIZE` at the start
+   of the paragraph.
+
+That is the entire diagnostic loop. It takes about three minutes once
+you have done it ten times.
+
+## Compile options that make dumps useful
+
+Three options change the quality of the listing — and therefore the
+dump's diagnostic value:
+
+| Option        | What it does                                                   |
+| ------------- | -------------------------------------------------------------- |
+| `LIST`        | Generate a procedure-division-by-procedure-division listing   |
+| `OFFSET`      | Include the offset of every COBOL verb in the listing         |
+| `MAP`         | Include a map of every data item with its offset in the program's storage |
+| `SOURCE`      | Print the source code in the listing (default on)             |
+
+The maintainer's checklist for any program that **might** ever ABEND in
+production: compile with `LIST`, `OFFSET`, `MAP`. The listing is
+slightly larger; the diagnostic value is enormous. Without `OFFSET`,
+locating a failing instruction by address is far harder.
+
+If you inherit a program compiled without these options, you compile
+it yourself — same source, same JCL, but with the better options — to
+produce a fresh listing for diagnosis. The PSW addresses change between
+compiles, but the source structure does not, so the new listing is
+valid against the old dump as long as the procedure-division logic
+matches.
+
+## Lab: predict the failing offset
+
+The program below performs an explicit ZAP-equivalent (a `MOVE` between
+packed-decimal items) on a deliberately-uninitialised target. In a
+real ABEND on this program, the dump would show the ZAP at a specific
+offset and the target's bytes would have a bad sign nibble.
+
+Run it; observe what happens. Then walk through what the dump would
+look like:
+
+- Which COBOL line emits the failing instruction?
+- What bytes would `WS-TARGET` hold at the moment of failure?
+
+<CodeLab
+  lessonId="cobol/abends/reading-a-sysudump"
+  runtime="server"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. DUMP-DEMO.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-SOURCE   PIC S9(7)V99 COMP-3 VALUE 1234567.89.
+01  WS-TARGET   PIC S9(7)V99 COMP-3.
+01  WS-RESULT   PIC S9(7)V99 COMP-3.
+
+PROCEDURE DIVISION.
+*  In production this would be the line whose offset appears in the
+*  dump. Note WS-TARGET is *not* initialised before the COMPUTE.
+*  The MOVE below is fine; the COMPUTE that follows is what would
+*  actually fail on z/OS with a bad-sign-nibble S0C7.
+
+*  Comment out the MOVE to simulate the uninitialised case under
+*  GnuCOBOL — the COMPUTE will then either produce a 0 or surface
+*  an error depending on the runtime.
+
+    MOVE ZERO TO WS-TARGET.
+
+    COMPUTE WS-TARGET = WS-TARGET + WS-SOURCE.
+    DISPLAY "WS-TARGET = " WS-TARGET.
+    STOP RUN.`}
+  hints={[
+    "On z/OS, omitting the MOVE ZERO would make WS-TARGET start with X'00 00 00 00 00' — the canonical S0C7 setup.",
+    "The compile listing would show the COMPUTE line emitting one or more AP/ZAP/SP packed-decimal instructions, each with an offset.",
+    "Map: WS-TARGET would be at a specific offset listed in the MAP section; you read the same address in the dump's storage to see the bytes."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/abends/reading-a-sysudump"
+  questions={[
+    {
+      prompt: "Rightmost 4 bytes of the PSW at ABEND?",
+      options: [
+        { id: "a", label: "Address of the NEXT instruction (one past the failing one).", correct: true, explanation: "PSW always points at next instruction. Back up to find the failing one." },
+        { id: "b", label: "Exact byte address of the failing instruction." },
+        { id: "c", label: "A status flag." },
+        { id: "d", label: "Reserved zero-padded." },
+      ],
+    },
+    {
+      prompt: "PSW=078D1000_004C8B72, CSECT base=004C8000. Where in the program?",
+      options: [
+        { id: "a", label: "Offset X'B72'.", correct: true, explanation: "PSW low half minus CSECT base. Look up in compile listing." },
+        { id: "b", label: "Offset X'4C8B72'." },
+        { id: "c", label: "Offset X'1000'." },
+        { id: "d", label: "Need linkage editor map." },
+      ],
+    },
+    {
+      prompt: "Listing shows '000B70 ZAP a,b' near the failing PSW. What is ZAP?",
+      options: [
+        { id: "a", label: "Zero and Add Packed — packed-decimal arithmetic instruction.", correct: true, explanation: "ZAP/AP/SP/MP/DP are packed-decimal hardware ops." },
+        { id: "b", label: "Unconditional branch." },
+        { id: "c", label: "End of paragraph marker." },
+        { id: "d", label: "CICS macro, unrelated." },
+      ],
+    },
+    {
+      prompt: "Field at X'00510234' is 5 bytes '20 25 31 03 00', declared PIC S9(7)V99 COMP-3. Problem?",
+      options: [
+        { id: "a", label: "Last byte's low nibble is X'0', not a valid sign — S0C7 on next arithmetic.", correct: true, explanation: "Valid signs: C, D, F. X'0' is invalid." },
+        { id: "b", label: "Nothing — value is 2025310300." },
+        { id: "c", label: "First byte should be X'00'." },
+        { id: "d", label: "Field is too short." },
+      ],
+    },
+    {
+      prompt: "CEEDUMP Traceback section shows what?",
+      options: [
+        { id: "a", label: "CALL chain: program / entry / statement / load module per frame.", correct: true, explanation: "Top is the failing program; below is who CALLed whom to get there." },
+        { id: "b", label: "Every dataset opened." },
+        { id: "c", label: "CPU usage timeline." },
+        { id: "d", label: "Last 100 SQL statements." },
+      ],
+    },
+  ]}
+/>
+
+## Up next
+
+The next lesson is **the S0C7 deep dive** — a complete worked example
+from console message to fix, demonstrating the methodology in this
+lesson on a real (well, real-shaped) program. By the end of it you
+should be able to walk a maintenance ticket from "the job ABENDed at
+2am" to "here is the line of code that caused it" without any
+assistance.
