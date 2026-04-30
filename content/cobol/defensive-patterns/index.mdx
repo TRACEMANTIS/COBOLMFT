@@ -1,0 +1,503 @@
+---
+module: abends
+order: 5
+title: Defensive patterns
+summary: INITIALIZE, the figurative constants (LOW-VALUES, HIGH-VALUES, SPACES, ZEROS), and the structural patterns that prevent S0C7 / S0C4 / U4038 from ever happening. The synthesis of everything in this module.
+estimatedMinutes: 25
+prerequisites: [hello-world, divisions, pic-and-comp3, anatomy-of-an-abend, condition-handling]
+objectives:
+  - Use INITIALIZE to set complex records to known defaults idiomatically.
+  - Choose LOW-VALUES, HIGH-VALUES, SPACES, or ZEROS deliberately rather than by reflex.
+  - Apply the "validate at the boundary" pattern to data from external sources.
+  - Structure a paragraph so that re-entering it cannot leave a half-initialised record.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: INITIALIZE WS-RECORD on a 01-level group. What does the default INITIALIZE do to a numeric subordinate field?
+      options:
+        - { id: a, label: "Sets it to ZEROS (binary or packed-decimal zero, depending on USAGE).", correct: true, explanation: "Default INITIALIZE sets numeric subordinates to ZERO (which packs correctly for COMP-3, sets binary 0 for COMP, and stores the zoned digit for DISPLAY). Alphanumeric subordinates get SPACES. This is exactly the right default for fixing 'forgot to initialize' bugs." }
+        - { id: b, label: "Sets it to SPACES." }
+        - { id: c, label: "Sets it to LOW-VALUES." }
+        - { id: d, label: "Leaves it untouched." }
+    - prompt: INITIALIZE WS-RECORD REPLACING NUMERIC BY 99 — what does this do?
+      options:
+        - { id: a, label: "Sets every numeric subordinate to 99 instead of the default ZERO; leaves alphanumerics at default SPACES.", correct: true, explanation: "REPLACING lets you override the default for one or more class categories. Useful when 'no data' should be represented by a sentinel value other than zero (e.g., '99' meaning 'not yet computed' for a code field)." }
+        - { id: b, label: "Sets alphanumeric fields to '99'." }
+        - { id: c, label: "Replaces literal 99 occurrences in the layout." }
+        - { id: d, label: "Causes a compile error." }
+    - prompt: A MOVE LOW-VALUES TO PIC X(8) produces what bytes?
+      options:
+        - { id: a, label: "Eight bytes of X'00' — the lowest possible value in the collating sequence.", correct: true, explanation: "LOW-VALUES is the figurative constant for the lowest collating value: X'00' on EBCDIC and ASCII alike. Used as a sentinel: 'this field has not been populated.' It will fail an IS NUMERIC test, which is intentional — it's a deliberate flag." }
+        - { id: b, label: "Eight EBCDIC spaces (X'40')." }
+        - { id: c, label: "Eight ASCII spaces (X'20')." }
+        - { id: d, label: "Eight bytes of X'FF'." }
+    - prompt: 'A program reads a 100-byte record into a buffer that''s declared 80 bytes. The program uses NO FILE STATUS check. What happens?'
+      options:
+        - { id: a, label: "The READ may truncate to 80 bytes silently or set a FILE STATUS that the program ignores; either way the program processes 80 bytes thinking it has 100. Bugs surface downstream.", correct: true, explanation: "Without a FILE STATUS check, the program has no signal that the read was wrong-sized. The defensive pattern is: declare the buffer to match the file's declared LRECL exactly, OR check FILE STATUS for code 04 (record length wrong) after every READ." }
+        - { id: b, label: "The runtime always ABENDs immediately." }
+        - { id: c, label: "The compiler refuses to compile." }
+        - { id: d, label: "The dataset is silently truncated on disk." }
+    - prompt: Which two of these are correct defensive structures for a paragraph that processes a customer record?
+      multi: true
+      options:
+        - { id: a, label: "INITIALIZE the entire output record on entry, then MOVE only the populated fields, then leave any field not relevant for this customer at its initialized default.", correct: true, explanation: "Initialize-first means re-entering the paragraph cannot leave stale data from the previous customer in the new output. The default values (zeros, spaces) are clean defaults." }
+        - { id: b, label: "Validate input fields with IS NUMERIC or class tests before using them, with explicit handling for invalid data.", correct: true, explanation: "Boundary validation. Catches bad data at entry rather than at the arithmetic three statements later." }
+        - { id: c, label: "Skip the INITIALIZE because COBOL fields keep their declared VALUE clauses across paragraph entries." }
+        - { id: d, label: "Trust the upstream program — if the data is wrong it's their problem." }
+---
+
+# Defensive patterns
+
+The four lessons before this told you what goes wrong. This one is
+about how to write code that doesn't go wrong in the first place. The
+techniques are unglamorous: initialise things, validate things, log
+things, structure things. Done consistently, they reduce the rate of
+2am pages by an order of magnitude. Done inconsistently, they produce
+the worst of both worlds — half-checked code that gives you false
+confidence between failures.
+
+This is the synthesis lesson for the ABENDs module. Every pattern here
+defends against a specific bug class you have already seen.
+
+## INITIALIZE — the right way to clear a record
+
+A `01`-level group with mixed PIC types is hard to clear correctly.
+You **could** write:
+
+```cobol
+MOVE SPACES TO WS-CUST-REC.
+```
+
+But this fails for any subordinate `COMP-3` or `COMP` field — moving
+spaces (`X'40 40 40...`) into a packed-decimal field gives you bytes
+that S0C7 on the next arithmetic. (You just learned this in the S0C7
+lesson.) Worst case, the move "succeeds" silently and the program
+continues, with a ticking time bomb in the record.
+
+The right verb is `INITIALIZE`:
+
+```cobol
+INITIALIZE WS-CUST-REC.
+```
+
+`INITIALIZE` walks the subordinate items and sets each to a
+class-appropriate default:
+
+| Subordinate type | Default |
+| ---------------- | ------- |
+| Alphanumeric (`PIC X`)               | SPACES (`X'40'` EBCDIC) |
+| Numeric (`PIC 9`, `PIC S9`, COMP, COMP-3) | ZEROS (binary, packed, or zoned zero as appropriate) |
+| Alphabetic (`PIC A`)                 | SPACES                |
+| FILLER                               | Untouched (by default) |
+
+This is exactly the right default for fixing forgot-to-initialise
+bugs. **Whenever you allocate a new record, INITIALIZE first.** Then
+populate the fields you have data for. Then write or use the record.
+
+### INITIALIZE ... REPLACING
+
+You can override the default for one or more categories:
+
+```cobol
+INITIALIZE WS-CUST-REC
+    REPLACING NUMERIC DATA BY ZERO
+    REPLACING ALPHANUMERIC DATA BY ALL "?".
+```
+
+Common pattern: set alphanumeric fields to `"?"` or `"NA"` so that
+output reports show clearly which fields the data did not populate,
+rather than blanks (which can be confused with valid empty data).
+
+You can also restrict to specific items:
+
+```cobol
+INITIALIZE WS-CUST-REC.
+INITIALIZE WS-CUST-NAME REPLACING ALPHANUMERIC BY "PENDING".
+```
+
+## The figurative constants
+
+Four "figurative constants" stand for special values:
+
+| Constant      | Value                                                       |
+| ------------- | ----------------------------------------------------------- |
+| `SPACES`      | One or more space characters (`X'40'` EBCDIC; `X'20'` ASCII) |
+| `ZEROS`       | One or more zeros (right type for the field)                |
+| `LOW-VALUES`  | The lowest character in the collating sequence (`X'00'`)    |
+| `HIGH-VALUES` | The highest (`X'FF'`)                                       |
+
+Each is **infinitely repeatable** — `MOVE SPACES TO WS-FIELD` fills
+WS-FIELD regardless of length. They are also context-aware: `MOVE
+ZEROS TO WS-PACKED` produces packed-zero bytes, while `MOVE ZEROS TO
+WS-ZONED` produces zoned-zero bytes.
+
+### When each is the right choice
+
+- **SPACES**: alphanumeric fields whose absence should look like empty
+  text in reports.
+- **ZEROS**: numeric fields whose absence should be treated as zero in
+  arithmetic.
+- **LOW-VALUES**: a sentinel for "this field is uninitialised" in
+  contexts where blanks/zeros are valid data. Common in keyed lookups
+  where `LOW-VALUES` for the key means "no key set, search will fail."
+- **HIGH-VALUES**: an end-of-table or end-of-file sentinel. Common in
+  merge-style code where the highest possible key signals "no more
+  records from this stream."
+
+### A common confusion: SPACES vs LOW-VALUES on PIC X
+
+```cobol
+01  WS-NAME        PIC X(30) VALUE SPACES.
+01  WS-KEY         PIC X(8)  VALUE LOW-VALUES.
+
+* In a comparison:
+IF WS-NAME = SPACES ...           *>  TRUE for an unpopulated name
+IF WS-KEY  = LOW-VALUES ...        *>  TRUE for an unpopulated key
+IF WS-KEY  = SPACES ...            *>  FALSE — X'00' is NOT a space
+```
+
+Distinguishing `LOW-VALUES` (binary zero) from `SPACES` (`X'40'`) is a
+maintenance shibboleth — when reading legacy code, the choice tells
+you what the original author intended the absence-of-data to mean.
+
+## Boundary validation
+
+The pattern: any data crossing into your program from outside (a file,
+a parameter, an external CALL, a screen field) is **untrusted**.
+Validate at the boundary. Inside the boundary, code can assume validity.
+
+```cobol
+* Bad: trust the input
+READ PARAM-FILE INTO WS-PARAM.
+COMPUTE PROCESS-OUTPUT = WS-PARAM-RATE * WS-AMOUNT.
+
+* Good: validate at the boundary
+READ PARAM-FILE INTO WS-PARAM.
+IF WS-PARAM-RATE-CHARS IS NUMERIC
+    COMPUTE WS-PARAM-RATE = FUNCTION NUMVAL(WS-PARAM-RATE-CHARS)
+ELSE
+    DISPLAY "BAD PARAM RATE: [" WS-PARAM-RATE-CHARS "]"
+    MOVE 1.0 TO WS-PARAM-RATE
+END-IF.
+
+COMPUTE PROCESS-OUTPUT = WS-PARAM-RATE * WS-AMOUNT.
+```
+
+Inside the validated section, every subsequent COMPUTE is safe — we
+know `WS-PARAM-RATE` is numeric. The S0C7 cannot happen here.
+
+The boundary is the right place because:
+
+- It's a single chokepoint. Validate there once instead of before
+  every arithmetic.
+- The error message can include the original raw input, which is the
+  most useful diagnostic.
+- The default-value path is explicit. Future maintainers see exactly
+  what the program does with bad input.
+
+What counts as a boundary in a real program:
+
+- **File reads** — every record from a file is "external."
+- **Database reads** — DB2 columns, especially nullable ones (a NULL
+  flowing into arithmetic is the canonical embedded-SQL S0C7).
+- **CALL parameters from outside the load module** — the caller might
+  be a different program with different data discipline.
+- **CICS COMMAREA on the first program of a transaction** — terminal
+  user input.
+
+Internal data flows (one paragraph passing data to another within the
+same program, computed values from validated inputs) do **not** need
+re-validation. Defensive checks at every site is the swamp pattern;
+checks at the boundaries is the right discipline.
+
+## The "every paragraph is restartable" pattern
+
+A paragraph that processes one record should be **idempotent on
+re-entry**: running it again with a different record should produce
+correct output, regardless of state left over from the previous run.
+
+The simplest way to enforce this is `INITIALIZE` at the top:
+
+```cobol
+PROCESS-CUSTOMER.
+    INITIALIZE WS-OUT-REC.
+
+    MOVE CUST-ID    OF WS-IN-REC TO CUST-ID    OF WS-OUT-REC.
+    MOVE CUST-NAME  OF WS-IN-REC TO CUST-NAME  OF WS-OUT-REC.
+
+    IF CUST-BAL OF WS-IN-REC IS NUMERIC
+        MOVE CUST-BAL OF WS-IN-REC TO CUST-BAL OF WS-OUT-REC
+    END-IF.
+*  CUST-BAL is left at the INITIALIZE default (ZERO) if input was bad.
+
+    IF HOURLY OF WS-IN-REC
+        PERFORM COMPUTE-HOURLY-PAY
+    END-IF.
+
+    IF SALARIED OF WS-IN-REC
+        PERFORM COMPUTE-SALARY
+    END-IF.
+*  Whichever path didn't run, its output fields stay at INITIALIZE
+*  defaults — they cannot leak from the previous customer.
+
+    WRITE WS-OUT-REC.
+```
+
+Without the `INITIALIZE`, a salaried customer following an hourly
+customer would inherit the hourly fields from the prior record. The
+output report would show the previous customer's hours and rate
+attached to the next customer's name. This is a real bug class.
+
+## Sentinels and explicit flags
+
+When a record can legitimately be missing a value, use a sentinel
+that's **not** a valid value:
+
+```cobol
+01  WS-BIRTH-DATE     PIC X(8).
+    88  BIRTH-DATE-UNKNOWN  VALUE LOW-VALUES.
+    88  BIRTH-DATE-PROVIDED VALUE "00010101" THRU "99991231".
+```
+
+Then in the procedure division: `IF BIRTH-DATE-UNKNOWN PERFORM
+HANDLE-MISSING-DATE`.
+
+This is much better than relying on "spaces means missing" because
+spaces are a valid (if unusual) data value, and the comparison `IF
+WS-BIRTH-DATE = SPACES` is opaque to a reader who doesn't know your
+convention. The `88` condition name names the meaning.
+
+## Logging that survives operations
+
+When a defensive check catches bad data, the log line that gets
+emitted is what tomorrow's maintainer reads. Make it useful:
+
+```cobol
+* Bad
+DISPLAY "bad data".
+
+* Less bad
+DISPLAY "bad customer record".
+
+* Production-grade
+DISPLAY "BAD-CUST: id=" CUST-ID
+        " field=BAL"
+        " value=[" CUST-BAL-CHARS "]"
+        " action=DEFAULTED-TO-ZERO".
+```
+
+Three things this gets right:
+
+- **Identifying tag** (`BAD-CUST:`) — easy to grep.
+- **Specific field** — the next maintainer doesn't have to guess.
+- **Actual offending value** — preserved as character so it can be
+  inspected even if it would S0C7 if interpreted numerically.
+- **Action taken** — explicit about what the program did with the
+  bad input.
+
+A log line in this shape, in a million-row job, lets ops look at the
+job log, count bad records, and see what got defaulted. Without it,
+"a hundred records got bad data, defaulted silently" is invisible to
+anyone reading the spool.
+
+## A defensive paragraph: full example
+
+Putting it all together — a paragraph that processes a customer
+record from an untrusted external file:
+
+```cobol
+PROCESS-EXTERNAL-CUST.
+    INITIALIZE WS-OUT-REC.
+    ADD 1 TO WS-RECORDS-READ.
+
+    IF CUST-ID OF WS-IN-REC = LOW-VALUES OR
+       CUST-ID OF WS-IN-REC = SPACES
+        DISPLAY "BAD-CUST: rec=" WS-RECORDS-READ
+                " field=ID"
+                " action=SKIPPED"
+        ADD 1 TO WS-BAD-COUNT
+        EXIT PARAGRAPH
+    END-IF.
+    MOVE CUST-ID OF WS-IN-REC TO CUST-ID OF WS-OUT-REC.
+
+    MOVE CUST-NAME OF WS-IN-REC TO CUST-NAME OF WS-OUT-REC.
+
+    IF CUST-BAL OF WS-IN-REC IS NUMERIC
+        MOVE CUST-BAL OF WS-IN-REC TO CUST-BAL OF WS-OUT-REC
+    ELSE
+        DISPLAY "BAD-CUST: id=" CUST-ID OF WS-IN-REC
+                " field=BAL"
+                " value=[" CUST-BAL OF WS-IN-REC "]"
+                " action=DEFAULTED-TO-ZERO"
+        ADD 1 TO WS-DEFAULTED-COUNT
+*       CUST-BAL stays at INITIALIZE default of ZERO
+    END-IF.
+
+    WRITE WS-OUT-REC
+        INVALID KEY
+            DISPLAY "WRITE-FAIL: id=" CUST-ID OF WS-OUT-REC
+                    " status=" WS-OUT-STATUS
+            ADD 1 TO WS-WRITE-FAILS
+    END-WRITE.
+
+    ADD 1 TO WS-RECORDS-WRITTEN.
+```
+
+What this paragraph guarantees, no matter what bytes are in the input
+file:
+
+- It cannot S0C7 — every numeric use is preceded by `IS NUMERIC`.
+- It cannot leave stale data — `INITIALIZE` resets the output record.
+- It cannot silently drop records — every skip and default produces a
+  log line.
+- It cannot lose write failures — `INVALID KEY` catches and logs.
+- Counts are accurate — `WS-RECORDS-READ`, `WS-BAD-COUNT`,
+  `WS-DEFAULTED-COUNT`, `WS-WRITE-FAILS`, `WS-RECORDS-WRITTEN`.
+  Operations can read the totals at end of job and reconcile.
+
+This is what production-grade COBOL looks like. Most legacy code is
+not written this way — which is exactly why this module exists.
+
+<Callout kind="tip" title="Defensive does not mean paranoid">
+
+The discipline is to validate **at the boundary**, not after every
+operation. A program that does `IF X IS NUMERIC` before every COMPUTE
+on internal data quickly becomes unreadable.
+
+The right shape is a thin validation layer at every place where data
+enters the program (file reads, DB2 fetches, CALL boundaries), and
+a clean inner core that trusts its inputs because the boundary
+already validated them. Your code should look like an onion, not
+like a minefield.
+
+</Callout>
+
+## Lab: predict, then run
+
+The program below is a small but complete defensive paragraph. Run it
+once with the bad record present, then change the bad record to valid
+data and re-run.
+
+<CodeLab
+  lessonId="cobol/abends/defensive-patterns"
+  runtime="server"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. DEF-DEMO.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-IN-RECORDS.
+    05  FILLER  PIC X(30) VALUE "C0001ALICE       0010050".
+    05  FILLER  PIC X(30) VALUE "C0002BOB         0020075".
+    05  FILLER  PIC X(30) VALUE "C0003CAROL       BADXX-X".
+    05  FILLER  PIC X(30) VALUE "C0004DAVID       0050025".
+01  WS-IN-TABLE REDEFINES WS-IN-RECORDS.
+    05  WS-IN-REC  OCCURS 4 TIMES.
+        10  IN-CUST-ID    PIC X(5).
+        10  IN-CUST-NAME  PIC X(15).
+        10  IN-CUST-BAL   PIC X(7).
+
+01  WS-OUT-CUST.
+    05  OUT-CUST-ID    PIC X(5).
+    05  OUT-CUST-NAME  PIC X(15).
+    05  OUT-CUST-BAL   PIC 9(5)V99.
+
+01  WS-IX            PIC 9(2).
+01  WS-OK-COUNT      PIC 9(2) VALUE 0.
+01  WS-BAD-COUNT     PIC 9(2) VALUE 0.
+
+PROCEDURE DIVISION.
+    PERFORM VARYING WS-IX FROM 1 BY 1 UNTIL WS-IX > 4
+        INITIALIZE WS-OUT-CUST
+
+        MOVE IN-CUST-ID(WS-IX)   TO OUT-CUST-ID
+        MOVE IN-CUST-NAME(WS-IX) TO OUT-CUST-NAME
+
+        IF IN-CUST-BAL(WS-IX) IS NUMERIC
+            MOVE IN-CUST-BAL(WS-IX) TO OUT-CUST-BAL
+            ADD 1 TO WS-OK-COUNT
+            DISPLAY "OK    id=" OUT-CUST-ID
+                    " name=" OUT-CUST-NAME
+                    " bal=" OUT-CUST-BAL
+        ELSE
+            DISPLAY "BAD   id=" OUT-CUST-ID
+                    " name=" OUT-CUST-NAME
+                    " bal-raw=[" IN-CUST-BAL(WS-IX) "]"
+                    " action=DEFAULTED-TO-ZERO"
+            ADD 1 TO WS-BAD-COUNT
+*           OUT-CUST-BAL stays at INITIALIZE default (zero)
+        END-IF
+    END-PERFORM.
+
+    DISPLAY "summary: ok=" WS-OK-COUNT ", bad=" WS-BAD-COUNT.
+    STOP RUN.`}
+  hints={[
+    "INITIALIZE on entry to each iteration prevents Carol's bad record from leaving stale data in the output.",
+    "IS NUMERIC catches the bad balance without an ABEND.",
+    "Counts are tracked separately for ok vs bad — operations can reconcile at end of job."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/abends/defensive-patterns"
+  questions={[
+    {
+      prompt: "INITIALIZE WS-RECORD on a 01-group — numeric subordinate becomes?",
+      options: [
+        { id: "a", label: "ZEROS (right type for USAGE).", correct: true, explanation: "Default INITIALIZE: numerics to ZERO, alphanumerics to SPACES." },
+        { id: "b", label: "SPACES." },
+        { id: "c", label: "LOW-VALUES." },
+        { id: "d", label: "Untouched." },
+      ],
+    },
+    {
+      prompt: "INITIALIZE WS-RECORD REPLACING NUMERIC BY 99 — effect?",
+      options: [
+        { id: "a", label: "Numerics get 99 instead of default ZERO; alphanumerics still SPACES.", correct: true, explanation: "REPLACING overrides per-class defaults." },
+        { id: "b", label: "Alphanumerics get '99'." },
+        { id: "c", label: "Replaces literal 99 in layout." },
+        { id: "d", label: "Compile error." },
+      ],
+    },
+    {
+      prompt: "MOVE LOW-VALUES TO PIC X(8) produces what bytes?",
+      options: [
+        { id: "a", label: "Eight bytes of X'00'.", correct: true, explanation: "LOW-VALUES is X'00' on EBCDIC and ASCII alike. Sentinel for 'unpopulated'." },
+        { id: "b", label: "Eight EBCDIC spaces (X'40')." },
+        { id: "c", label: "Eight ASCII spaces (X'20')." },
+        { id: "d", label: "Eight bytes of X'FF'." },
+      ],
+    },
+    {
+      prompt: "READ a 100-byte record into an 80-byte buffer with no FILE STATUS check?",
+      options: [
+        { id: "a", label: "Truncated or status set silently; program processes 80 bytes; bugs surface downstream.", correct: true, explanation: "FILE STATUS code 04 indicates wrong record length. Check it." },
+        { id: "b", label: "Always ABENDs." },
+        { id: "c", label: "Compile refuses." },
+        { id: "d", label: "Dataset truncated on disk." },
+      ],
+    },
+    {
+      prompt: "Which two defensive structures are correct for processing a customer record?",
+      multi: true,
+      options: [
+        { id: "a", label: "INITIALIZE on entry, MOVE only populated fields, leave irrelevant fields at default.", correct: true, explanation: "Re-entry cannot leak stale data." },
+        { id: "b", label: "Validate inputs with class tests before use, with explicit handling.", correct: true, explanation: "Boundary validation." },
+        { id: "c", label: "Skip INITIALIZE — fields keep VALUE clauses across paragraph entries." },
+        { id: "d", label: "Trust the upstream — bad data is their problem." },
+      ],
+    },
+  ]}
+/>
+
+## End of module
+
+This is the final lesson in the **abends** module. Together with
+`anatomy-of-an-abend`, `reading-a-sysudump`, `s0c7-deep-dive`, and
+`condition-handling`, it covers the diagnostic and defensive
+techniques a maintainer relies on every shift. The next module is
+**JCL deeper** — DD statements, procedures, and conditional restart —
+the operating environment around the COBOL program. From there, the
+combined skills of "read code", "read dump", "read JCL" let you
+handle the bulk of a maintainer's daily incidents end to end.
