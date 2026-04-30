@@ -1,0 +1,442 @@
+---
+module: data-layout
+order: 5
+title: String handling
+summary: STRING, UNSTRING, INSPECT, and reference modification — the verbs you reach for when you need to parse a field, build an output line, or examine character data without an off-by-one bug.
+estimatedMinutes: 25
+prerequisites: [hello-world, divisions, pic-and-comp3]
+objectives:
+  - Build a delimited or fixed-width output line with STRING.
+  - Parse a delimited input line with UNSTRING and a count.
+  - Use INSPECT to count, replace, or tally characters.
+  - Read a reference modification (1-based, length-based) without translating in your head.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: "Reference modification: WS-NAME(3:5). What does this mean?"
+      options:
+        - { id: a, label: "Bytes 3 through 5 inclusive (3 bytes)." }
+        - { id: b, label: "Starting at byte 3, take 5 bytes (so bytes 3 through 7).", correct: true, explanation: "Reference modification is start:length — both 1-based. WS-NAME(3:5) is the substring from position 3 with length 5, occupying positions 3 through 7." }
+        - { id: c, label: "Bytes 3 through 5 zero-based." }
+        - { id: d, label: "The third character repeated 5 times." }
+    - prompt: "STRING with three operands and a single DELIMITED BY SIZE — what controls how many bytes of each operand are appended?"
+      options:
+        - { id: a, label: "Each operand contributes its full declared size.", correct: true, explanation: "DELIMITED BY SIZE means 'use the operand's full length.' DELIMITED BY SPACE or DELIMITED BY some literal stops at that delimiter and skips it." }
+        - { id: b, label: "STRING stops at the first space in any operand." }
+        - { id: c, label: "Each operand contributes only up to its first non-blank character." }
+        - { id: d, label: "It's controlled by the ON OVERFLOW phrase." }
+    - prompt: "ON OVERFLOW on STRING — when does it fire?"
+      options:
+        - { id: a, label: "When the destination field runs out of room before all source operands have been appended.", correct: true, explanation: "ON OVERFLOW catches a too-small target. Without it, STRING silently truncates. With it, you get a code path to handle the overflow." }
+        - { id: b, label: "When any source operand is longer than the destination." }
+        - { id: c, label: "When STRING encounters a NULL in the source." }
+        - { id: d, label: "When the POINTER variable wraps." }
+    - prompt: "INSPECT WS-LINE TALLYING WS-COUNT FOR ALL ',' — what does WS-COUNT contain when this finishes?"
+      options:
+        - { id: a, label: "The number of commas in WS-LINE.", correct: true, explanation: "TALLYING ... FOR ALL accumulates a count of every occurrence of the search operand." }
+        - { id: b, label: "The position of the first comma." }
+        - { id: c, label: "1 if any comma is found, 0 otherwise." }
+        - { id: d, label: "The total length of WS-LINE." }
+    - prompt: Which two of these patterns will silently produce wrong output?
+      multi: true
+      options:
+        - { id: a, label: "STRING three 30-byte fields DELIMITED BY SIZE INTO a 50-byte target with no ON OVERFLOW.", correct: true, explanation: "STRING silently truncates if the target runs out of room and there is no ON OVERFLOW handler." }
+        - { id: b, label: "UNSTRING DELIMITED BY ',' INTO five fields when the input has only three commas, no TALLYING IN clause.", correct: true, explanation: "Without a TALLYING IN count, the program cannot tell which destination fields actually got data and which still hold their previous values. Production code uses TALLYING IN to know the real field count." }
+        - { id: c, label: "INSPECT with REPLACING ALL on a known character." }
+        - { id: d, label: "STRING with DELIMITED BY SIZE on operands of known sizes that fit in the target." }
+---
+
+# String handling
+
+COBOL was built to push fixed-width records around. Anything more
+flexible — building a comma-delimited output, parsing a CSV header,
+trimming a trailing-space-padded name — needs the four string verbs.
+They are not glamorous and they are easy to use wrong; this lesson
+covers the patterns that work and the ones that quietly do not.
+
+## Reference modification — the foundation
+
+Before the verbs, the most common string operation in any COBOL
+program: **reference modification**. The notation `field(start:length)`
+extracts a substring.
+
+```cobol
+01  WS-NAME    PIC X(30).
+01  WS-INITIAL PIC X.
+
+* WS-NAME = "MICHAEL                       "
+MOVE WS-NAME(1:1) TO WS-INITIAL.    *> "M"
+DISPLAY WS-NAME(8:7).               *> "       " — 7 spaces past the name
+```
+
+Three things to internalise:
+
+1. **`start` is 1-based.** Position 1 is the first byte. There is no
+   position 0.
+2. **`length` is a length, not an end.** `WS-NAME(1:5)` is bytes 1
+   through 5 (5 bytes), not "between 1 and 5."
+3. **The length is optional.** `WS-NAME(8:)` means "from byte 8 to
+   the end."
+
+Reference modification works in any context that takes an
+alphanumeric field — `MOVE`, `DISPLAY`, `IF`, the source of `STRING`,
+the target of `UNSTRING`, etc. It does not work on packed-decimal or
+zoned-numeric items unless you first redefine them as `PIC X`.
+
+A real maintainer pattern, trimming a trailing-space-padded name to
+just the meaningful prefix:
+
+```cobol
+* Find the last non-space position.
+01  WS-NAME       PIC X(30).
+01  WS-LAST-POS   PIC 9(3).
+
+PERFORM VARYING WS-LAST-POS FROM 30 BY -1
+        UNTIL WS-LAST-POS = 0
+           OR WS-NAME(WS-LAST-POS:1) NOT = SPACE
+END-PERFORM.
+
+* WS-LAST-POS now holds the position of the last non-space, or 0.
+DISPLAY "[" WS-NAME(1:WS-LAST-POS) "]".
+```
+
+This is the COBOL equivalent of `rtrim()`. Worth memorising.
+
+## STRING — concatenation with delimiters
+
+`STRING` builds a destination field by appending source operands. The
+basic form:
+
+```cobol
+01  WS-FIRST   PIC X(15) VALUE "ALICE".
+01  WS-LAST    PIC X(20) VALUE "WONDERLAND".
+01  WS-FULL    PIC X(40).
+
+STRING WS-FIRST  DELIMITED BY SPACE
+       " "       DELIMITED BY SIZE
+       WS-LAST   DELIMITED BY SPACE
+    INTO WS-FULL
+END-STRING.
+
+DISPLAY "[" WS-FULL "]".  *> "[ALICE WONDERLAND                       ]"
+```
+
+The `DELIMITED BY` phrase decides how much of each operand gets
+appended:
+
+| Phrase                   | What it appends                                              |
+| ------------------------ | ------------------------------------------------------------ |
+| `DELIMITED BY SIZE`      | The operand's full declared length                           |
+| `DELIMITED BY SPACE`     | Up to (but not including) the first space                    |
+| `DELIMITED BY "literal"` | Up to (but not including) the first occurrence of the literal |
+| `DELIMITED BY ws-field`  | Up to (but not including) the first occurrence of `ws-field`'s value |
+
+For our example: `WS-FIRST DELIMITED BY SPACE` appends "ALICE"
+(stops at the first space). `" " DELIMITED BY SIZE` appends a single
+space. `WS-LAST DELIMITED BY SPACE` appends "WONDERLAND."
+
+### POINTER — tracking position across multiple STRINGs
+
+You can track the position in the destination across multiple STRING
+operations:
+
+```cobol
+01  WS-FULL    PIC X(40).
+01  WS-PTR     PIC 9(3) VALUE 1.
+
+STRING WS-FIRST DELIMITED BY SPACE
+    INTO WS-FULL WITH POINTER WS-PTR
+END-STRING.
+
+* WS-PTR now points just past the last byte written.
+
+STRING " "      DELIMITED BY SIZE
+       WS-LAST  DELIMITED BY SPACE
+    INTO WS-FULL WITH POINTER WS-PTR
+END-STRING.
+```
+
+The POINTER **must be initialised to 1** before the first STRING.
+Forgetting this initialisation, or relying on COBOL's default (which
+may be 0 depending on definition), is the canonical bug — the second
+STRING starts at position 0 and corrupts.
+
+### ON OVERFLOW — knowing when you ran out of room
+
+`STRING` silently truncates if the destination runs out of room. The
+`ON OVERFLOW` phrase catches it:
+
+```cobol
+STRING source-1 DELIMITED BY SIZE
+       source-2 DELIMITED BY SIZE
+    INTO WS-TARGET
+    ON OVERFLOW
+        DISPLAY "warning: STRING overflow at ptr=" WS-PTR
+END-STRING.
+```
+
+The standard maintainer rule: **if the destination is smaller than
+the worst-case sum of the sources, use `ON OVERFLOW`.** Without it
+you have a silent-truncation bug waiting for the day a longer record
+shows up.
+
+## UNSTRING — parsing delimited input
+
+`UNSTRING` is `STRING` in reverse. It splits a source field on a
+delimiter and writes the pieces into a list of destination fields.
+
+```cobol
+01  WS-INPUT     PIC X(80) VALUE "ALICE,30,BOSTON,USA".
+01  WS-NAME      PIC X(20).
+01  WS-AGE       PIC X(3).
+01  WS-CITY      PIC X(20).
+01  WS-COUNTRY   PIC X(10).
+01  WS-FIELD-CT  PIC 9(3).
+
+UNSTRING WS-INPUT
+    DELIMITED BY ","
+    INTO WS-NAME
+         WS-AGE
+         WS-CITY
+         WS-COUNTRY
+    TALLYING IN WS-FIELD-CT
+END-UNSTRING.
+
+* WS-NAME = "ALICE", WS-AGE = "30", WS-CITY = "BOSTON",
+* WS-COUNTRY = "USA", WS-FIELD-CT = 4.
+```
+
+Things worth remembering:
+
+- **`TALLYING IN` gives you the actual field count.** Without it, you
+  cannot distinguish "input had four fields" from "input had two
+  fields and the last two destinations still hold their prior values."
+  Always include it.
+- **Each destination field gets the source piece padded or truncated
+  to fit.** `WS-AGE` is 3 bytes; "30" gets two characters and a
+  trailing space (or whatever the field's prior value held in byte 3
+  if the field is left-justified).
+- **DELIMITED BY ALL "x"** treats consecutive delimiters as one. Without
+  `ALL`, two commas in a row mean the field between them is empty.
+- **DELIMITER IN** captures which delimiter was found: useful if you
+  have multiple delimiters in one UNSTRING (`DELIMITED BY "," OR ";"`).
+
+## INSPECT — count, replace, tally
+
+`INSPECT` walks a field looking for a pattern and either counts
+matches, replaces them, or both.
+
+### TALLYING — counting
+
+```cobol
+01  WS-LINE     PIC X(80) VALUE "name,age,city,country,zip".
+01  WS-COMMAS   PIC 9(3) VALUE 0.
+
+INSPECT WS-LINE TALLYING WS-COMMAS FOR ALL ",".
+
+* WS-COMMAS = 4
+```
+
+Initialise `WS-COMMAS` to zero before INSPECT — TALLYING **adds** to
+the counter, it does not reset.
+
+### REPLACING — transforming
+
+```cobol
+INSPECT WS-LINE REPLACING ALL "," BY "|".
+
+* "name|age|city|country|zip"
+```
+
+Common variations:
+
+- `REPLACING ALL c1 BY c2` — replace every occurrence
+- `REPLACING LEADING SPACES BY ZEROS` — typical for numeric padding
+- `REPLACING FIRST c1 BY c2` — only the first occurrence
+- `REPLACING CHARACTERS BY c2` — replace every character (the whole
+  field becomes c2; rarely what you want)
+
+### TALLYING + REPLACING combined
+
+```cobol
+INSPECT WS-LINE
+    TALLYING WS-COMMAS FOR ALL ","
+    REPLACING ALL "," BY "|".
+```
+
+One pass, two side effects. The compiler emits efficient code for
+this; using two separate INSPECTs is wasteful.
+
+### CONVERTING — character-class translation
+
+```cobol
+INSPECT WS-LINE CONVERTING
+    "abcdefghijklmnopqrstuvwxyz"
+    TO "ABCDEFGHIJKLMNOPQRSTUVWXYZ".
+```
+
+Lowercase to uppercase. CONVERTING is two parallel character lists
+of equal length; each character in the first is replaced by the
+corresponding character in the second.
+
+## A worked example: parsing then rebuilding
+
+A maintainer's pattern: read a comma-delimited record, validate the
+field count, convert to upper case, and rewrite as pipe-delimited.
+
+```cobol
+01  WS-IN          PIC X(80).
+01  WS-OUT         PIC X(120).
+01  WS-FIELDS.
+    05  F-NAME     PIC X(20).
+    05  F-AGE      PIC X(3).
+    05  F-CITY     PIC X(20).
+    05  F-COUNTRY  PIC X(15).
+01  WS-FIELD-CT    PIC 9(3) VALUE 0.
+01  WS-PTR         PIC 9(3) VALUE 1.
+
+PROCESS-LINE.
+    UNSTRING WS-IN DELIMITED BY ","
+        INTO F-NAME F-AGE F-CITY F-COUNTRY
+        TALLYING IN WS-FIELD-CT
+    END-UNSTRING.
+
+    IF WS-FIELD-CT NOT = 4
+        DISPLAY "bad record, " WS-FIELD-CT " fields, expected 4"
+        EXIT PARAGRAPH
+    END-IF.
+
+    INSPECT F-NAME    CONVERTING "abcdefghijklmnopqrstuvwxyz"
+                      TO "ABCDEFGHIJKLMNOPQRSTUVWXYZ".
+    INSPECT F-CITY    CONVERTING "abcdefghijklmnopqrstuvwxyz"
+                      TO "ABCDEFGHIJKLMNOPQRSTUVWXYZ".
+    INSPECT F-COUNTRY CONVERTING "abcdefghijklmnopqrstuvwxyz"
+                      TO "ABCDEFGHIJKLMNOPQRSTUVWXYZ".
+
+    MOVE 1 TO WS-PTR.
+    STRING F-NAME    DELIMITED BY SPACE
+           "|"       DELIMITED BY SIZE
+           F-AGE     DELIMITED BY SPACE
+           "|"       DELIMITED BY SIZE
+           F-CITY    DELIMITED BY SPACE
+           "|"       DELIMITED BY SIZE
+           F-COUNTRY DELIMITED BY SPACE
+        INTO WS-OUT WITH POINTER WS-PTR
+        ON OVERFLOW
+            DISPLAY "output overflow"
+    END-STRING.
+```
+
+Three patterns worth marking:
+
+- `TALLYING IN WS-FIELD-CT` then a check — defensive parse.
+- `INSPECT ... CONVERTING` for case fold — one pass per field.
+- `STRING ... WITH POINTER ... ON OVERFLOW` — building output with
+  position tracking and a defined failure path.
+
+## Lab: predict, then run
+
+Below is a small program demonstrating reference modification,
+INSPECT, and STRING. Read it, predict the output, then run.
+
+<CodeLab
+  lessonId="cobol/data-layout/string-handling"
+  runtime="server"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. STR-DEMO.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-INPUT       PIC X(40) VALUE "alice,30,boston,usa".
+01  WS-COUNT       PIC 9(3) VALUE 0.
+01  WS-OUT         PIC X(60).
+01  WS-PTR         PIC 9(3) VALUE 1.
+
+PROCEDURE DIVISION.
+    INSPECT WS-INPUT TALLYING WS-COUNT FOR ALL ",".
+    DISPLAY "comma count: " WS-COUNT.
+
+    INSPECT WS-INPUT CONVERTING
+        "abcdefghijklmnopqrstuvwxyz"
+        TO "ABCDEFGHIJKLMNOPQRSTUVWXYZ".
+    DISPLAY "uppercased:  [" WS-INPUT "]".
+
+    DISPLAY "first 5:     [" WS-INPUT(1:5) "]".
+
+    STRING "name=" DELIMITED BY SIZE
+           WS-INPUT(1:5) DELIMITED BY SIZE
+           "; rest=" DELIMITED BY SIZE
+           WS-INPUT(7:) DELIMITED BY SPACE
+        INTO WS-OUT WITH POINTER WS-PTR
+        ON OVERFLOW
+            DISPLAY "overflow!"
+    END-STRING.
+    DISPLAY "built:       [" WS-OUT "]".
+    STOP RUN.`}
+  hints={[
+    "INSPECT TALLYING accumulates — note WS-COUNT starts at zero.",
+    "Reference modification (1:5) is start:length, not start:end.",
+    "WS-INPUT(7:) is 'from byte 7 to the end'."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/data-layout/string-handling"
+  questions={[
+    {
+      prompt: "Reference modification: WS-NAME(3:5). What does this mean?",
+      options: [
+        { id: "a", label: "Bytes 3 through 5 inclusive (3 bytes)." },
+        { id: "b", label: "Starting at byte 3, take 5 bytes (positions 3 through 7).", correct: true, explanation: "start:length, both 1-based." },
+        { id: "c", label: "Bytes 3 through 5 zero-based." },
+        { id: "d", label: "The third character repeated 5 times." },
+      ],
+    },
+    {
+      prompt: "STRING with three operands DELIMITED BY SIZE — how much of each appends?",
+      options: [
+        { id: "a", label: "Each operand contributes its full declared size.", correct: true, explanation: "DELIMITED BY SIZE means full length." },
+        { id: "b", label: "STRING stops at the first space in any operand." },
+        { id: "c", label: "Each operand contributes only up to its first non-blank character." },
+        { id: "d", label: "Controlled by ON OVERFLOW." },
+      ],
+    },
+    {
+      prompt: "When does ON OVERFLOW on STRING fire?",
+      options: [
+        { id: "a", label: "When the destination runs out of room.", correct: true, explanation: "Without ON OVERFLOW, STRING silently truncates." },
+        { id: "b", label: "When any source operand is longer than the destination." },
+        { id: "c", label: "When STRING encounters a NULL." },
+        { id: "d", label: "When the POINTER wraps." },
+      ],
+    },
+    {
+      prompt: "INSPECT WS-LINE TALLYING WS-COUNT FOR ALL ',' — what does WS-COUNT contain afterward?",
+      options: [
+        { id: "a", label: "The number of commas in WS-LINE.", correct: true, explanation: "TALLYING ALL accumulates a count." },
+        { id: "b", label: "The position of the first comma." },
+        { id: "c", label: "1 if any comma is found, 0 otherwise." },
+        { id: "d", label: "The total length of WS-LINE." },
+      ],
+    },
+    {
+      prompt: "Which two of these patterns silently produce wrong output?",
+      multi: true,
+      options: [
+        { id: "a", label: "STRING three 30-byte fields DELIMITED BY SIZE into a 50-byte target with no ON OVERFLOW.", correct: true, explanation: "Silent truncation." },
+        { id: "b", label: "UNSTRING into five fields with input that has only three commas and no TALLYING IN.", correct: true, explanation: "Cannot tell real field count from stale destination contents." },
+        { id: "c", label: "INSPECT REPLACING ALL on a known character." },
+        { id: "d", label: "STRING DELIMITED BY SIZE on operands that fit in the target." },
+      ],
+    },
+  ]}
+/>
+
+## Up next
+
+The final lesson in this module is **numeric edge cases** —
+`ROUNDED`, `ON SIZE ERROR`, the `NUMPROC` and `TRUNC` compiler
+options, and the signed-vs-unsigned mismatches that produce
+inscrutable arithmetic bugs. The patterns to ABS-protect your
+programs against the bad data they will eventually see.

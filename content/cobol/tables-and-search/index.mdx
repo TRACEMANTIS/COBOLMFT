@@ -1,0 +1,397 @@
+---
+module: data-layout
+order: 4
+title: Tables and SEARCH
+summary: Turning an OCCURS into a usable lookup — subscripts vs indexes, linear SEARCH vs binary SEARCH ALL, and the KEY-clause discipline that decides whether your lookup is fast or quietly wrong.
+estimatedMinutes: 30
+prerequisites: [hello-world, divisions, pic-and-comp3, redefines-and-occurs]
+objectives:
+  - Distinguish subscripts from indexes and pick the right one for a job.
+  - Use SEARCH for unsorted (linear) lookups and SEARCH ALL for sorted (binary) lookups.
+  - Set up an OCCURS clause with KEY IS so SEARCH ALL is correct.
+  - Recognise the silent failure modes — SEARCH ALL on unsorted data, missing AT END, wrong index variable.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: A subscript is conceptually a 1-based ordinal. An index is conceptually what?
+      options:
+        - { id: a, label: "A pre-computed byte offset, scaled to the entry size by the compiler.", correct: true, explanation: "INDEXED BY declares an index variable. SET ix TO 1 means the compiler computes the offset of the first element. Increment by 1 means jump by the element size, not by 1 byte. This is why indexes are faster than subscripts." }
+        - { id: b, label: "A 0-based ordinal." }
+        - { id: c, label: "A pointer to the heap entry." }
+        - { id: d, label: "A handle that the runtime tracks separately from the table." }
+    - prompt: SEARCH ALL on a table that is not actually sorted by the KEY field. What happens?
+      options:
+        - { id: a, label: "Compile error." }
+        - { id: b, label: "Runtime ABEND." }
+        - { id: c, label: "Silent wrong answer — SEARCH ALL is binary search; on unsorted data it returns whatever the algorithm walks into.", correct: true, explanation: "There is no runtime check. If you said ASCENDING KEY but the table is unsorted, SEARCH ALL still divides and conquers, and you get a deterministic wrong answer (or the AT END branch fires when the entry is actually present)." }
+        - { id: d, label: "Falls back to linear search automatically." }
+    - prompt: SEARCH and SEARCH ALL — which uses an INDEXED BY index and which can use either an index or a subscript?
+      options:
+        - { id: a, label: "SEARCH requires INDEXED BY. SEARCH ALL also requires INDEXED BY.", correct: true, explanation: "Both verbs require an index. Subscripts work for direct access (TABLE-ITEM(7)) but not for SEARCH-style verbs. The compiler enforces this." }
+        - { id: b, label: "SEARCH allows either; SEARCH ALL requires INDEXED BY." }
+        - { id: c, label: "Both allow either." }
+        - { id: d, label: "SEARCH requires INDEXED BY; SEARCH ALL allows either." }
+    - prompt: "You SEARCH a table and the target is not present. Without an AT END phrase, what happens?"
+      options:
+        - { id: a, label: "Runtime ABEND." }
+        - { id: b, label: "The index is left at its final value (one past the table) and the SEARCH falls through to the next statement.", correct: true, explanation: "AT END is optional. Without it, a not-found case silently falls through, the index is past the end, and the next reference to TABLE(ix) reads garbage. This is the canonical SEARCH bug." }
+        - { id: c, label: "The index is reset to 1." }
+        - { id: d, label: "The compiler refuses to compile." }
+    - prompt: For SEARCH ALL to work correctly, the OCCURS must declare which two things?
+      multi: true
+      options:
+        - { id: a, label: "INDEXED BY", correct: true, explanation: "SEARCH ALL needs an index, not a subscript." }
+        - { id: b, label: "ASCENDING KEY IS or DESCENDING KEY IS pointing at the field used in the WHEN.", correct: true, explanation: "The KEY clause tells the compiler what column the binary search divides on. The runtime trusts this — it does not verify the table is actually sorted." }
+        - { id: c, label: "USAGE COMP-3 on the search field." }
+        - { id: d, label: "A FILE STATUS variable." }
+---
+
+# Tables and SEARCH
+
+A 50-state code-to-name lookup. A 200-row product-tier table. A
+catalog of error codes mapped to messages. These are the workhorses
+of any maintainer's daily work, and COBOL gives you two verbs for
+walking them: `SEARCH` (linear) and `SEARCH ALL` (binary). The verbs
+are reliable; the bugs are about how the table is set up before the
+verb runs.
+
+This lesson is the practical layer on top of `OCCURS`: when to use a
+subscript, when to use an index, how to choose between `SEARCH` and
+`SEARCH ALL`, and the silent failure modes that survive code review.
+
+## Subscripts vs indexes
+
+`OCCURS` gives you a table. The two ways to walk it are subscripts
+and indexes — they look similar, behave differently, and the choice
+matters.
+
+### Subscript access
+
+A subscript is a **1-based ordinal** stored in any numeric field:
+
+```cobol
+01  STATE-TABLE.
+    05  STATE-ENTRY  OCCURS 50 TIMES.
+        10  STATE-CODE  PIC X(2).
+        10  STATE-NAME  PIC X(20).
+01  WS-IX             PIC 9(3).
+
+PROCEDURE DIVISION.
+    MOVE 7 TO WS-IX.
+    DISPLAY STATE-CODE(WS-IX).
+```
+
+At access time the compiler emits code that multiplies `WS-IX` by the
+entry size (22 bytes) and adds the table's base address. That
+multiplication happens **on every access**.
+
+### Index access
+
+An index variable is declared with `INDEXED BY`:
+
+```cobol
+01  STATE-TABLE.
+    05  STATE-ENTRY  OCCURS 50 TIMES  INDEXED BY ST-IX.
+        10  STATE-CODE  PIC X(2).
+        10  STATE-NAME  PIC X(20).
+
+PROCEDURE DIVISION.
+    SET ST-IX TO 1.
+    DISPLAY STATE-CODE(ST-IX).
+```
+
+`ST-IX` is special. It is a binary-coded byte offset — the compiler
+already scaled it to the entry size. `SET ST-IX UP BY 1` adds the
+22-byte entry size to the index. No runtime multiplication.
+
+### Practical rules
+
+| Use case                                | Pick      |
+| --------------------------------------- | --------- |
+| One-shot direct access (`TABLE(7)`)     | Subscript — easier to read |
+| Walking the table in a loop             | Index — faster, no per-access multiplication |
+| `SEARCH` or `SEARCH ALL`                | Index — required by the verb |
+| Saving the position for later           | Subscript — index isn't portable |
+| Passing the position to another program | Subscript — index can't cross program boundaries |
+
+A small thing worth knowing: you cannot directly `MOVE` between an
+index and a numeric field. You use `SET ix TO numeric-field` and
+`SET numeric-field TO ix`. The compiler does the conversion. Forget
+this and you get a compile error, not a subtle bug — the language
+catches it.
+
+## Linear search — SEARCH
+
+`SEARCH` walks the table from the current index value forward,
+checking each `WHEN` condition until one matches or the index runs
+past the end of the table.
+
+```cobol
+SET ST-IX TO 1.
+SEARCH STATE-ENTRY
+    AT END
+        DISPLAY "no state matched"
+    WHEN STATE-CODE(ST-IX) = WS-WANTED
+        DISPLAY "found: " STATE-NAME(ST-IX).
+```
+
+A few things to internalise:
+
+1. **The starting position is whatever the index already holds.**
+   `SEARCH` does **not** reset it for you. If the index is already
+   past the entry you wanted, `SEARCH` will not find it. The
+   habitual `SET ST-IX TO 1.` before every `SEARCH` is defensive
+   and correct.
+2. **`AT END` runs only if the search exhausts the table.** Without
+   `AT END`, a not-found search falls through silently with the
+   index left at one past the end of the table. The next statement
+   that references `STATE-CODE(ST-IX)` reads bytes that are not part
+   of the table.
+3. **Multiple `WHEN`s** are tested in order against each entry. The
+   first that matches stops the search. You can also have:
+   `WHEN cond-1 imperative-1 WHEN cond-2 imperative-2 ...`
+
+`SEARCH` is `O(n)`. For a 50-row table this is fine. For a 50,000-row
+parameter table (yes, those exist in real shops), it's a real
+performance hit, and `SEARCH ALL` is the answer.
+
+## Binary search — SEARCH ALL
+
+`SEARCH ALL` is binary search. It requires the table to be **sorted**
+by the field used in the `WHEN`, and the OCCURS must declare which
+field is the sort key:
+
+```cobol
+01  STATE-TABLE.
+    05  STATE-ENTRY  OCCURS 50 TIMES
+                     ASCENDING KEY IS STATE-CODE
+                     INDEXED BY ST-IX.
+        10  STATE-CODE  PIC X(2).
+        10  STATE-NAME  PIC X(20).
+```
+
+Now:
+
+```cobol
+SEARCH ALL STATE-ENTRY
+    AT END
+        DISPLAY "no state matched"
+    WHEN STATE-CODE(ST-IX) = WS-WANTED
+        DISPLAY "found: " STATE-NAME(ST-IX).
+```
+
+Two things change:
+
+1. **`SEARCH ALL` initializes the index itself.** You do not `SET
+   ST-IX TO 1` first; the runtime starts the binary search at the
+   midpoint and walks. Setting the index manually before `SEARCH
+   ALL` is a no-op, not a bug.
+2. **The `WHEN` condition must compare the declared key.** You can
+   only test equality on the key field; you cannot use `>=` or
+   substring matches. The runtime relies on the comparison being on
+   the sort key for divide-and-conquer to work.
+
+`SEARCH ALL` is `O(log n)`. For a 50-row table it is hardly faster
+than `SEARCH`. For a 50,000-row table it is the difference between
+microseconds and milliseconds per lookup. Multiplied by the lookups
+in a batch job processing five million records, this matters.
+
+<Callout kind="warn" title="The silent failure of SEARCH ALL">
+
+`SEARCH ALL` trusts you. If the OCCURS is declared `ASCENDING KEY
+IS STATE-CODE` but the table loaded into memory is not actually
+sorted by `STATE-CODE`, the binary search returns whatever entry the
+divide-and-conquer happens to land on — possibly an `AT END` even
+though the entry is present, possibly a wrong row. There is no
+runtime check, no warning.
+
+This is the second-most-common production lookup bug after "missing
+AT END." The fix is to ensure the table is sorted at load time —
+either by reading from a presorted file, or by sorting the table in
+memory after load with a small helper paragraph.
+
+</Callout>
+
+## A worked lookup: error code → message
+
+A real maintainer's pattern: a table of return codes mapped to
+display messages. Loaded from a file at program start, queried
+thousands of times during the job.
+
+```cobol
+WORKING-STORAGE SECTION.
+01  WS-MSG-COUNT             PIC 9(4).
+01  ERROR-MSG-TABLE.
+    05  ERROR-MSG-ENTRY      OCCURS 1 TO 1000 TIMES
+                             DEPENDING ON WS-MSG-COUNT
+                             ASCENDING KEY IS EM-CODE
+                             INDEXED BY EM-IX.
+        10  EM-CODE          PIC X(8).
+        10  EM-MESSAGE       PIC X(60).
+
+01  WS-LOOKUP-CODE           PIC X(8).
+01  WS-LOOKUP-MSG            PIC X(60).
+
+PROCEDURE DIVISION.
+    PERFORM LOAD-MSG-TABLE.
+
+* ... later, on a per-record basis ...
+
+LOOKUP-MESSAGE.
+    SEARCH ALL ERROR-MSG-ENTRY
+        AT END
+            MOVE "**unknown error code**" TO WS-LOOKUP-MSG
+        WHEN EM-CODE(EM-IX) = WS-LOOKUP-CODE
+            MOVE EM-MESSAGE(EM-IX) TO WS-LOOKUP-MSG.
+```
+
+Things this code gets right:
+
+- ODO with a count field — table size is data-driven.
+- `ASCENDING KEY` declared so `SEARCH ALL` is legal.
+- `AT END` with a meaningful default. Production code never lets
+  unknown lookups fall through silently.
+- Index used because `SEARCH ALL` requires one.
+
+Things you should look for in code review:
+
+- Is the load actually producing a sorted table? A `LOAD-MSG-TABLE`
+  paragraph that reads an unsorted file and stuffs entries into the
+  OCCURS in arrival order is the silent-failure setup.
+- Is `WS-MSG-COUNT` updated correctly during load? Off-by-one on the
+  count makes the last entry inaccessible (or accessible with garbage
+  in the unused tail).
+
+## Performance reality
+
+`SEARCH` vs `SEARCH ALL` is one of the rare COBOL choices where the
+"right answer" depends on table size:
+
+| Table size | Better choice | Reason |
+|------------|---------------|--------|
+| < 20 rows  | `SEARCH`      | Simpler; binary search overhead doesn't pay off |
+| 20–500     | Either, lean toward `SEARCH ALL` | Binary search starts to matter at sustained access |
+| > 500      | `SEARCH ALL`  | Linear search becomes a noticeable cost in batch |
+
+The maintainer's instinct: when you read a paragraph that does
+`SEARCH` against a multi-thousand-row table inside a tight loop, that
+is a candidate for `SEARCH ALL` — *if* the table is sorted by the
+search key. If it's not, you fix the load step first, declare the
+KEY, then change the verb.
+
+## Lab: predict, then run
+
+A small program that does both styles of search on the same table.
+Read it, predict the output, then run.
+
+<CodeLab
+  lessonId="cobol/data-layout/tables-and-search"
+  runtime="server"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. SEARCH-DEMO.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  STATE-TABLE.
+    05  STATE-ENTRY  OCCURS 5 TIMES
+                     ASCENDING KEY IS STATE-CODE
+                     INDEXED BY ST-IX.
+        10  STATE-CODE  PIC X(2).
+        10  STATE-NAME  PIC X(15).
+
+01  WS-WANTED         PIC X(2).
+01  WS-FOUND          PIC X.
+
+PROCEDURE DIVISION.
+    MOVE "AK" TO STATE-CODE(1).  MOVE "ALASKA"      TO STATE-NAME(1).
+    MOVE "AL" TO STATE-CODE(2).  MOVE "ALABAMA"     TO STATE-NAME(2).
+    MOVE "AR" TO STATE-CODE(3).  MOVE "ARKANSAS"    TO STATE-NAME(3).
+    MOVE "AZ" TO STATE-CODE(4).  MOVE "ARIZONA"     TO STATE-NAME(4).
+    MOVE "CA" TO STATE-CODE(5).  MOVE "CALIFORNIA"  TO STATE-NAME(5).
+
+    MOVE "AR" TO WS-WANTED.
+
+* Linear SEARCH — must SET the index first.
+    SET ST-IX TO 1.
+    SEARCH STATE-ENTRY
+        AT END
+            DISPLAY "linear: not found"
+        WHEN STATE-CODE(ST-IX) = WS-WANTED
+            DISPLAY "linear: " STATE-NAME(ST-IX) " (idx=" ST-IX ")"
+    END-SEARCH.
+
+* Binary SEARCH ALL — runtime sets the index itself.
+    SEARCH ALL STATE-ENTRY
+        AT END
+            DISPLAY "binary: not found"
+        WHEN STATE-CODE(ST-IX) = WS-WANTED
+            DISPLAY "binary: " STATE-NAME(ST-IX) " (idx=" ST-IX ")"
+    END-SEARCH.
+
+    STOP RUN.`}
+  hints={[
+    "Both searches should find AR; binary search reaches the answer in fewer comparisons.",
+    "Note the SET ST-IX TO 1 before SEARCH but not before SEARCH ALL.",
+    "The table is loaded in alphabetical order — the ASCENDING KEY clause is true for this data."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/data-layout/tables-and-search"
+  questions={[
+    {
+      prompt: "An index is conceptually what?",
+      options: [
+        { id: "a", label: "A pre-computed byte offset, scaled to the entry size by the compiler.", correct: true, explanation: "Indexes are pre-scaled — increment by 1 means jump one whole entry." },
+        { id: "b", label: "A 0-based ordinal." },
+        { id: "c", label: "A pointer to the heap entry." },
+        { id: "d", label: "A handle that the runtime tracks separately from the table." },
+      ],
+    },
+    {
+      prompt: "SEARCH ALL on a table that is not sorted by the KEY field — what happens?",
+      options: [
+        { id: "a", label: "Compile error." },
+        { id: "b", label: "Runtime ABEND." },
+        { id: "c", label: "Silent wrong answer.", correct: true, explanation: "Binary search trusts the declared sort. No runtime check." },
+        { id: "d", label: "Falls back to linear search." },
+      ],
+    },
+    {
+      prompt: "SEARCH and SEARCH ALL — what do they require?",
+      options: [
+        { id: "a", label: "Both require INDEXED BY.", correct: true, explanation: "Both verbs need an index." },
+        { id: "b", label: "SEARCH allows either; SEARCH ALL requires INDEXED BY." },
+        { id: "c", label: "Both allow either." },
+        { id: "d", label: "SEARCH requires INDEXED BY; SEARCH ALL allows either." },
+      ],
+    },
+    {
+      prompt: "Without an AT END phrase on SEARCH and the target is not in the table, what happens?",
+      options: [
+        { id: "a", label: "Runtime ABEND." },
+        { id: "b", label: "The index ends up past the table and SEARCH falls through silently.", correct: true, explanation: "Canonical SEARCH bug. The next reference reads garbage." },
+        { id: "c", label: "The index is reset to 1." },
+        { id: "d", label: "Compile error." },
+      ],
+    },
+    {
+      prompt: "For SEARCH ALL to work correctly, the OCCURS must declare which two things?",
+      multi: true,
+      options: [
+        { id: "a", label: "INDEXED BY", correct: true, explanation: "SEARCH ALL needs an index." },
+        { id: "b", label: "ASCENDING or DESCENDING KEY IS ...", correct: true, explanation: "Tells the compiler the sort column. Trusted, not verified." },
+        { id: "c", label: "USAGE COMP-3 on the search field." },
+        { id: "d", label: "A FILE STATUS variable." },
+      ],
+    },
+  ]}
+/>
+
+## Up next
+
+The next lesson is **string handling** — `STRING`, `UNSTRING`,
+`INSPECT`, and reference modification. The verbs you reach for when
+you need to parse, build, or examine character data, and the patterns
+that separate clean implementations from buffer-juggling messes.

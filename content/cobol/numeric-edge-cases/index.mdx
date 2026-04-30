@@ -1,0 +1,404 @@
+---
+module: data-layout
+order: 6
+title: Numeric edge cases
+summary: ROUNDED, ON SIZE ERROR, the NUMPROC and TRUNC compiler options, and the signed-vs-unsigned mismatches that produce subtle arithmetic bugs. The patterns that protect programs from the bad data they will eventually see.
+estimatedMinutes: 30
+prerequisites: [hello-world, divisions, pic-and-comp3]
+objectives:
+  - Use ROUNDED and ON SIZE ERROR to handle precision and overflow explicitly.
+  - Predict the effect of NUMPROC(PFD) vs NUMPROC(NOPFD) vs NUMPROC(MIG) on arithmetic.
+  - Predict the effect of TRUNC(STD) vs TRUNC(OPT) vs TRUNC(BIN) on COMP fields.
+  - Recognise the canonical signed/unsigned mismatch bug.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: "COMPUTE WS-RATIO = 7 / 3 with WS-RATIO declared PIC S9(3)V99. What value lands in WS-RATIO?"
+      options:
+        - { id: a, label: "2.33", correct: true, explanation: "Default arithmetic carries enough digits to fill the target's V99 (two decimal places). 7/3 = 2.333..., truncated (default) to 2.33." }
+        - { id: b, label: "2.34 (rounded)" }
+        - { id: c, label: "2.00" }
+        - { id: d, label: "Causes ON SIZE ERROR." }
+    - prompt: "COMPUTE WS-A = WS-A + 1, where WS-A is PIC 9(3) and currently holds 999. Without ROUNDED or ON SIZE ERROR, what is WS-A afterward?"
+      options:
+        - { id: a, label: "1000 (the field somehow grows)." }
+        - { id: b, label: "0 — high-order digits are silently lost.", correct: true, explanation: "Default behavior on overflow is silent truncation of the high-order digits. 1000 doesn't fit in 3 digits; the result is the low-order 3 digits, which is 000. ON SIZE ERROR is the way to catch this." }
+        - { id: c, label: "999 — the operation is silently skipped." }
+        - { id: d, label: "Compile error." }
+    - prompt: "NUMPROC(PFD) compiler option — what assumption does it embed in the generated code?"
+      options:
+        - { id: a, label: "That all numeric DISPLAY (zoned) and COMP-3 fields contain valid sign nibbles (C, D, or F).", correct: true, explanation: "PFD = Preferred sign. The compiler emits faster code that assumes valid signs. If a field has a 'wrong' sign nibble (e.g., F where the field expects S), arithmetic may produce wrong results without an ABEND. NOPFD generates slower but more forgiving code that fixes up bad signs." }
+        - { id: b, label: "That all COMP fields are big-endian." }
+        - { id: c, label: "That all numeric fields fit in 31 bits." }
+        - { id: d, label: "That arithmetic is always rounded." }
+    - prompt: "TRUNC(BIN) — when a COMP fullword would overflow its declared PIC 9(4) (max 9999), what happens?"
+      options:
+        - { id: a, label: "The field is allowed to hold its full binary range — up to 32767 for a halfword, up to 2,147,483,647 for a fullword.", correct: true, explanation: "TRUNC(BIN) treats COMP as binary integers and lets them use the full hardware width. TRUNC(STD) truncates to the PIC's decimal range (PIC 9(4) max 9999). TRUNC(OPT) is in between. This option is the difference between a counter that overflows at 9999 vs at 32767." }
+        - { id: b, label: "Always ABENDs at 10000." }
+        - { id: c, label: "Wraps to 0 at PIC range." }
+        - { id: d, label: "Compile error." }
+    - prompt: "WS-A is PIC 9(5) (unsigned). WS-B is PIC S9(5). COMPUTE WS-A = 100 - 200. What lands in WS-A?"
+      options:
+        - { id: a, label: "-100 with the sign indication lost (the absolute value 100 in the bytes)." }
+        - { id: b, label: "Undefined — depends on NUMPROC, but commonly the value is 100 or 99900 with the negative flag stripped.", correct: true, explanation: "An unsigned target holding a negative result is a sign-mismatch bug. The compiler may store the absolute value, the wrapped value, or whatever the platform's unsigned representation produces. Production code keeps the target signed (PIC S9) when the result might go negative." }
+        - { id: c, label: "Always 100." }
+        - { id: d, label: "Always 0." }
+---
+
+# Numeric edge cases
+
+Most COBOL arithmetic in the wild is uneventful: add a deduction to a
+total, multiply a quantity by a price, increment a counter. But the
+edge cases — overflow, precision, sign mismatch, the four or five
+compile options that change arithmetic semantics — are where the
+interesting bugs live. A bug class that does not surface until row
+500,000 of a five-million-row batch is one a maintainer must
+recognise on sight.
+
+This lesson covers the language-level controls (`ROUNDED`, `ON SIZE
+ERROR`), the compiler options that change generated code (`NUMPROC`,
+`TRUNC`), and the canonical mismatch bugs that survive code review.
+
+## ROUNDED — controlling precision loss
+
+When an arithmetic result has more decimal places than the target,
+COBOL's default is **truncation** of the extra digits.
+
+```cobol
+01  WS-PRICE     PIC S9(5)V99 COMP-3 VALUE 19.99.
+01  WS-DISCOUNT  PIC S9(3)V99 COMP-3 VALUE 0.10.
+01  WS-RESULT    PIC S9(5)V99 COMP-3.
+
+COMPUTE WS-RESULT = WS-PRICE * WS-DISCOUNT.
+*  19.99 * 0.10 = 1.999, truncated to 1.99
+```
+
+The third decimal `9` is silently dropped. `ROUNDED` changes that to
+the nearest representable value:
+
+```cobol
+COMPUTE WS-RESULT ROUNDED = WS-PRICE * WS-DISCOUNT.
+*  19.99 * 0.10 = 1.999, rounded to 2.00
+```
+
+The maintainer's instinct: when reading a money-flow program, look
+for `ROUNDED` on every running-total or rate calculation. Silent
+truncation on a per-row basis adds up to a real penny over a million
+rows.
+
+`ROUNDED` works on every arithmetic verb: `ADD`, `SUBTRACT`,
+`MULTIPLY`, `DIVIDE`, `COMPUTE`. The keyword goes after the target:
+
+```cobol
+ADD WS-LINE-TAX TO WS-RUNNING-TAX ROUNDED.
+DIVIDE WS-NET BY WS-COUNT GIVING WS-AVG ROUNDED.
+```
+
+## ON SIZE ERROR — handling overflow
+
+When an arithmetic result has more high-order digits than the target,
+the **high-order digits are silently lost**:
+
+```cobol
+01  WS-COUNTER  PIC 9(3) VALUE 999.
+
+ADD 1 TO WS-COUNTER.
+*  WS-COUNTER is now 0 — 1000 truncates to 000
+```
+
+`ON SIZE ERROR` catches this:
+
+```cobol
+ADD 1 TO WS-COUNTER
+    ON SIZE ERROR
+        DISPLAY "counter overflow"
+        MOVE 0 TO WS-COUNTER
+END-ADD.
+```
+
+When the result would lose high-order digits, the imperative under
+`ON SIZE ERROR` runs and the target is **not modified**. (Without
+the explicit `MOVE 0`, `WS-COUNTER` would still be 999.)
+
+The companion phrase `NOT ON SIZE ERROR` is rarely useful but
+exists; it runs only when no overflow occurred.
+
+The maintainer's rule: **any arithmetic on a counter, accumulator, or
+running total in a long-running batch program needs `ON SIZE ERROR`
+or a target wide enough to be impossible to overflow.** Otherwise the
+job runs forever, "succeeds" with a wrong total, and the symptom
+shows up in a downstream report a week later.
+
+`ON SIZE ERROR` also fires for division by zero, with the target
+unchanged.
+
+## Compiler options that change arithmetic
+
+Two compiler options do more to change generated code than any
+language feature: `NUMPROC` and `TRUNC`. A program compiled with
+`NUMPROC(PFD)` is not interchangeable with one compiled with
+`NUMPROC(NOPFD)`. Knowing what your shop uses is a maintenance
+prerequisite; the SHOWMSG / compile listing is the place to look.
+
+### NUMPROC — sign nibble assumptions
+
+`NUMPROC` controls what the compiler assumes about sign nibbles in
+zoned and packed decimal fields.
+
+| Option        | Generated code                                          | Tradeoff                       |
+| ------------- | ------------------------------------------------------- | ------------------------------ |
+| `NUMPROC(PFD)`   | Trust the field's declared sign — emit straight `AP`/`SP`. | Fastest. Wrong-sign data produces wrong results without an ABEND. |
+| `NUMPROC(NOPFD)` | Fix up "preferred" signs (F to C for unsigned, etc.) before arithmetic. | Slower. Tolerates moderately wrong data. |
+| `NUMPROC(MIG)`   | Emit code matching VS COBOL II semantics. | Migration aid for old code. |
+
+The "preferred sign" terminology refers to a convention: positive
+zoned numerics use `C` as the sign nibble, negative use `D`,
+unsigned use `F`. A `PIC S9(2)` containing `F2 F5` ("25" with an
+unsigned-style sign) is *legal* zoned-decimal-with-an-unconventional-
+sign. `PFD` assumes you never do this. `NOPFD` fixes it up first.
+
+The maintainer's reality: if the shop runs `PFD` (the default for
+modern compiles, faster), code that produces fields with non-preferred
+signs — most often, code that `MOVE`s a `PIC X` into a `PIC 9` —
+will produce wrong results in arithmetic without ABENDing. The output
+just disagrees with reality.
+
+### TRUNC — what does PIC truncation mean for COMP?
+
+`COMP` (binary) fields have a hardware width (halfword: 2 bytes,
+fullword: 4 bytes, doubleword: 8 bytes) that does not always match
+the declared `PIC` decimal range. `TRUNC` controls what wins.
+
+| Option       | A `PIC 9(4) COMP` (declared max 9999) holds...               |
+| ------------ | ------------------------------------------------------------ |
+| `TRUNC(STD)` | At most 9999. Overflow truncates to the PIC range.           |
+| `TRUNC(OPT)` | Whatever fits in the hardware width if the compiler can prove safety. Otherwise STD. |
+| `TRUNC(BIN)` | The full hardware halfword range — up to 32767 (signed) or 65535 (unsigned). |
+
+A real-world consequence: a counter declared `PIC 9(4) COMP` is
+"safe up to 9999" under `TRUNC(STD)` but actually rolls over at
+32767 under `TRUNC(BIN)`. The same source compiled with different
+options has different overflow behavior. Programs ported between
+shops or upgraded between compiler versions hit this.
+
+If the shop runs `TRUNC(BIN)` (common, faster), declare your COMP
+counters wide enough for their *binary* range, not the *decimal*
+range you wrote. Or use `COMP-3` and never think about this again.
+
+## Signed vs unsigned — the canonical mismatch
+
+The most common arithmetic bug in maintenance code:
+
+```cobol
+01  WS-A     PIC 9(5).            *> unsigned!
+01  WS-B     PIC S9(5).
+01  WS-C     PIC S9(5).
+
+COMPUTE WS-A = WS-B - WS-C.
+```
+
+If `WS-B = 100`, `WS-C = 200`, the arithmetic produces `-100`, but
+`WS-A` cannot represent a negative value. What lands in `WS-A`
+depends on `NUMPROC`, the compiler, and the platform — commonly
+either the absolute value `00100` with the negative bit silently
+stripped, or `99900` (a wrap-around). Neither is what the developer
+wanted.
+
+The fix is to declare the target signed: `PIC S9(5)`. Or to test the
+operands first and only assign when the result is non-negative.
+
+A related bug: using an unsigned `COMP-3` field for a value that can
+go negative.
+
+```cobol
+01  WS-RUNNING  PIC 9(7)V99 COMP-3.   *> unsigned packed
+```
+
+The sign nibble in the last byte is `F` (unsigned). If the program
+ever computes a negative running balance — perhaps because a refund
+arrived before the corresponding sale — the arithmetic instruction
+either truncates to absolute value, sets the field to a wrong-sign
+state, or S0C7s on the next read. Production code uses `S9` for any
+field that might go negative; the rare exceptions (counts, offsets,
+quantities-on-hand) are explicit in their declaration.
+
+## Decimal alignment — where V matters
+
+In any arithmetic verb, COBOL **aligns operands on the implied
+decimal point V** before computing. This is invisible to the
+language user but visible at the byte level.
+
+```cobol
+01  WS-A     PIC S9(5)V99   COMP-3 VALUE 100.50.
+01  WS-B     PIC S9(3)V9    COMP-3 VALUE 25.5.
+01  WS-C     PIC S9(5)V99   COMP-3.
+
+COMPUTE WS-C = WS-A + WS-B.
+*  WS-C = 126.00 — WS-B's 25.5 is treated as 25.50 for the add
+```
+
+The compiler emits a temporary that aligns `WS-B` to two decimal
+places before adding. You don't see it; the result is correct.
+
+Where it matters for maintainers:
+
+- `WS-A + WS-B` may carry one more decimal digit internally than
+  either operand. If the target has fewer decimals, you lose
+  precision (truncation) unless `ROUNDED` is specified.
+- Comparison via `IF WS-A = WS-B` aligns the decimal points too.
+  `IF 1.5 = 1.50` is true.
+
+## A worked example: a defensive accumulator
+
+```cobol
+01  WS-LINE-AMT   PIC S9(7)V99 COMP-3.
+01  WS-RUNNING    PIC S9(13)V99 COMP-3 VALUE 0.   *> wide on purpose
+01  WS-COUNT      PIC 9(7)     VALUE 0.
+01  WS-OVERFLOWS  PIC 9(5)     VALUE 0.
+
+ACCUMULATE.
+    ADD 1 TO WS-COUNT
+        ON SIZE ERROR
+            DISPLAY "row count overflow at row " WS-COUNT
+            MOVE 0 TO WS-COUNT
+    END-ADD.
+
+    ADD WS-LINE-AMT TO WS-RUNNING ROUNDED
+        ON SIZE ERROR
+            DISPLAY "running total overflow at line " WS-COUNT
+            ADD 1 TO WS-OVERFLOWS
+    END-ADD.
+```
+
+What this gets right:
+
+- **Wide accumulator** (`S9(13)V99`) — for a five-million-row batch
+  with average $100 lines, the running total is around half a billion.
+  `S9(11)V99` would be marginal; `S9(13)V99` is comfortable.
+- **`ROUNDED`** on the running total — per-row rounding error
+  accumulates over a long batch.
+- **`ON SIZE ERROR`** on both the count and the total — defined
+  failure paths instead of silent corruption.
+- **Signed targets** — `S9` everywhere so a refund or correction can
+  produce a negative interim balance without a sign mismatch.
+
+This is what production-grade arithmetic looks like. Most legacy
+code does not look like this; one of the maintainer's regular tasks
+is identifying which counters are at real risk of overflow and
+hardening them defensively, ideally before the overnight batch fails.
+
+## Lab: predict, then run
+
+The program below demonstrates the silent-overflow bug, the
+ROUNDED fix for precision loss, and the unsigned-target sign
+mismatch.
+
+<CodeLab
+  lessonId="cobol/data-layout/numeric-edge-cases"
+  runtime="server"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. NUM-DEMO.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-COUNTER       PIC 9(3) VALUE 998.
+01  WS-PRICE         PIC S9(5)V99 COMP-3 VALUE 19.99.
+01  WS-DISCOUNT      PIC S9V99    COMP-3 VALUE 0.10.
+01  WS-DISC-AMT-T    PIC S9(5)V99 COMP-3.
+01  WS-DISC-AMT-R    PIC S9(5)V99 COMP-3.
+01  WS-OVERFLOWS     PIC 9(2) VALUE 0.
+
+PROCEDURE DIVISION.
+
+* 1. silent overflow demo
+    DISPLAY "before: WS-COUNTER=" WS-COUNTER.
+    ADD 5 TO WS-COUNTER.
+    DISPLAY "after silent +5: WS-COUNTER=" WS-COUNTER.
+    DISPLAY "  (1003 truncated to 003 because the target is PIC 9(3))".
+
+* 2. caught overflow demo
+    MOVE 998 TO WS-COUNTER.
+    ADD 5 TO WS-COUNTER
+        ON SIZE ERROR
+            ADD 1 TO WS-OVERFLOWS
+            MOVE 0 TO WS-COUNTER
+    END-ADD.
+    DISPLAY "after caught +5: WS-COUNTER=" WS-COUNTER
+            ", overflows=" WS-OVERFLOWS.
+
+* 3. truncation vs ROUNDED
+    COMPUTE WS-DISC-AMT-T = WS-PRICE * WS-DISCOUNT.
+    COMPUTE WS-DISC-AMT-R ROUNDED = WS-PRICE * WS-DISCOUNT.
+    DISPLAY "truncated: " WS-DISC-AMT-T
+            "   rounded: " WS-DISC-AMT-R.
+    STOP RUN.`}
+  hints={[
+    "PIC 9(3) plus 5 starting at 998 lands at 003 (silent truncation).",
+    "ON SIZE ERROR catches the same overflow — the imperative runs and the target is not modified by the failing ADD.",
+    "19.99 * 0.10 = 1.999 — truncated to 1.99, rounded to 2.00."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/data-layout/numeric-edge-cases"
+  questions={[
+    {
+      prompt: "COMPUTE WS-RATIO = 7 / 3, WS-RATIO is PIC S9(3)V99. Result?",
+      options: [
+        { id: "a", label: "2.33", correct: true, explanation: "Default truncation to V99." },
+        { id: "b", label: "2.34 (rounded)" },
+        { id: "c", label: "2.00" },
+        { id: "d", label: "ON SIZE ERROR fires." },
+      ],
+    },
+    {
+      prompt: "WS-A is PIC 9(3) holding 999. ADD 1 TO WS-A with no ROUNDED or ON SIZE ERROR. Result?",
+      options: [
+        { id: "a", label: "1000 (the field grows)." },
+        { id: "b", label: "0 — high-order digits silently lost.", correct: true, explanation: "Default behavior is silent truncation." },
+        { id: "c", label: "999 (operation skipped)." },
+        { id: "d", label: "Compile error." },
+      ],
+    },
+    {
+      prompt: "NUMPROC(PFD) — what does it assume?",
+      options: [
+        { id: "a", label: "All numeric fields contain valid sign nibbles (C, D, or F).", correct: true, explanation: "PFD trusts declared signs; faster code, less forgiving." },
+        { id: "b", label: "All COMP fields are big-endian." },
+        { id: "c", label: "All numeric fields fit in 31 bits." },
+        { id: "d", label: "Arithmetic is always rounded." },
+      ],
+    },
+    {
+      prompt: "TRUNC(BIN) — what does a PIC 9(4) COMP halfword actually hold?",
+      options: [
+        { id: "a", label: "Up to the full halfword binary range — 32767 signed.", correct: true, explanation: "TRUNC(BIN) uses hardware width." },
+        { id: "b", label: "Always ABENDs at 10000." },
+        { id: "c", label: "Wraps to 0 at PIC range." },
+        { id: "d", label: "Compile error." },
+      ],
+    },
+    {
+      prompt: "WS-A is PIC 9(5) (unsigned). COMPUTE WS-A = 100 - 200. What lands in WS-A?",
+      options: [
+        { id: "a", label: "-100 with the sign lost." },
+        { id: "b", label: "Undefined — sign-mismatch bug.", correct: true, explanation: "An unsigned target holding a negative result is a real bug. Use S9 when the result might be negative." },
+        { id: "c", label: "Always 100." },
+        { id: "d", label: "Always 0." },
+      ],
+    },
+  ]}
+/>
+
+## End of module
+
+This is the last lesson in the **data-layout** module. Together with
+`pic-and-comp3`, `redefines-and-occurs`, `copybooks`, `tables-and-
+search`, and this lesson, it covers the byte-level reading and
+manipulation skills a maintainer reaches for daily.
+
+The next module is **file I/O** — sequential reads and writes, VSAM
+KSDS / ESDS / RRDS, and the file-status discipline that turns "the
+job ABENDed" into "the job ABENDed because the dataset is in
+exclusive use by another job."

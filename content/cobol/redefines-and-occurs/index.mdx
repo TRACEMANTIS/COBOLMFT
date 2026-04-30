@@ -1,0 +1,439 @@
+---
+module: data-layout
+order: 2
+title: REDEFINES and OCCURS
+summary: The same bytes seen two different ways, and how COBOL describes arrays in a fixed-layout language. The two clauses that turn flat records into structured data.
+estimatedMinutes: 30
+prerequisites: [hello-world, divisions, pic-and-comp3]
+objectives:
+  - Read a REDEFINES clause and predict which bytes overlap.
+  - Recognise the legal patterns for REDEFINES (same-or-smaller, no VALUE, 88-levels OK).
+  - Predict the byte size of fixed and variable OCCURS clauses.
+  - Recognise the silent failures from subscript-out-of-range and missing SSRANGE.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: A 01-level group is 50 bytes. Can a REDEFINES of that group describe 60 bytes?
+      options:
+        - { id: a, label: "No — the redefining item must be the same size or smaller.", correct: true, explanation: "Modern COBOL requires the redefining item to fit within the storage of the redefined item. Smaller is allowed; larger is a compile error." }
+        - { id: b, label: "Yes — REDEFINES allocates new storage for the larger size." }
+        - { id: c, label: "Yes — but only at level 01." }
+        - { id: d, label: "No — REDEFINES is illegal on group items." }
+    - prompt: "OCCURS 5 TIMES on a group whose unsubscripted size is 12 bytes. How big is the table?"
+      options:
+        - { id: a, label: "12 bytes" }
+        - { id: b, label: "60 bytes", correct: true, explanation: "Fixed OCCURS n TIMES allocates n × element-size. 5 × 12 = 60." }
+        - { id: c, label: "17 bytes" }
+        - { id: d, label: "Depends on the data." }
+    - prompt: "WS-COUNT is 0 and the OCCURS is OCCURS 1 TO 100 DEPENDING ON WS-COUNT. What does CUST-TABLE(1) reference?"
+      options:
+        - { id: a, label: "The first element, normally." }
+        - { id: b, label: "Undefined behavior — the table has zero elements.", correct: true, explanation: "ODO with the depending-on count at zero is a logically-empty table. The compiler does not check this; whatever bytes follow the table get accessed. Production-grade defensive code checks the count first." }
+        - { id: c, label: "An automatic compile error." }
+        - { id: d, label: "An automatic S0C7." }
+    - prompt: Without the SSRANGE compile option, what happens at runtime if you reference TABLE-ITEM(7) on a TABLE that only OCCURS 5 TIMES?
+      options:
+        - { id: a, label: "S0C7 always." }
+        - { id: b, label: "S0C4 always." }
+        - { id: c, label: "Undefined: silent corruption, S0C4, or pure luck depending on what bytes follow.", correct: true, explanation: "Without SSRANGE the runtime does not check bounds. The compiler emits a load from the computed offset, and what is at that offset is what you get. Real production code accidentally reads neighboring fields all the time." }
+        - { id: d, label: "Compile error." }
+    - prompt: Which of these REDEFINES clauses is illegal?
+      multi: true
+      options:
+        - { id: a, label: "05  ALT-DATE  REDEFINES  RAW-DATE  PIC 9(8).", explanation: "Same-size REDEFINES is fine." }
+        - { id: b, label: "05  ALT-FIELD  REDEFINES  ORIG-FIELD  PIC X(50)  VALUE SPACES.", correct: true, explanation: "VALUE on a REDEFINES is illegal (88-level condition names are the only exception)." }
+        - { id: c, label: "05  ALT-COUNT  REDEFINES  ORIG-FIELD  PIC X(50).", explanation: "Same-size, no VALUE — fine." }
+        - { id: d, label: "01  WORK-AREA  REDEFINES  STORAGE-AREA.", correct: true, explanation: "REDEFINES at level 01 in WORKING-STORAGE is illegal in standard COBOL. (FILE SECTION 01s under an FD describe alternate record layouts implicitly, no REDEFINES needed.)" }
+---
+
+# REDEFINES and OCCURS
+
+A flat byte buffer is rarely how data really wants to be read. A
+record's first byte might decide whether the rest is a customer or a
+vendor. A loyalty-points table might hold 1 to 50 entries depending on
+account history. A date-as-`9(8)` is also `YYYY MM DD`. Production
+COBOL handles all of this with two clauses: `REDEFINES` (same bytes,
+two shapes) and `OCCURS` (a repeating group, fixed or variable).
+
+By the end of this lesson you should read a copybook with `REDEFINES`
+and `OCCURS` and immediately know the byte layout, the legal access
+patterns, and the silent failure modes that cause production tickets.
+
+## REDEFINES — same bytes, different shape
+
+`REDEFINES` declares an alias of an earlier item that occupies the
+**same storage** but describes a different layout. The compiler does not
+allocate new memory; it just gives you a second name for the bytes
+already there.
+
+```cobol
+01  RAW-DATE             PIC 9(8).
+01  PARSED-DATE  REDEFINES  RAW-DATE.
+    05  PD-YEAR          PIC 9(4).
+    05  PD-MONTH         PIC 9(2).
+    05  PD-DAY           PIC 9(2).
+```
+
+8 bytes total — for **both** items. `RAW-DATE` and `PD-YEAR` share the
+first 4 bytes. Storing `20240315` into `RAW-DATE` makes `PD-YEAR=2024`,
+`PD-MONTH=03`, `PD-DAY=15` instantly, with no MOVE required.
+
+The classic maintainer use is **alternate views of a record-type byte**:
+
+```cobol
+01  TXN-RECORD.
+    05  TXN-TYPE         PIC X.
+    05  TXN-BODY         PIC X(99).
+
+01  CUST-RECORD  REDEFINES  TXN-RECORD.
+    05  FILLER           PIC X.
+    05  CUST-ID          PIC X(8).
+    05  CUST-NAME        PIC X(30).
+    05  CUST-BAL         PIC S9(9)V99 COMP-3.
+    05  FILLER           PIC X(56).
+
+01  VENDOR-RECORD  REDEFINES  TXN-RECORD.
+    05  FILLER           PIC X.
+    05  VEND-ID          PIC 9(6).
+    05  VEND-NAME        PIC X(40).
+    05  VEND-LIMIT       PIC S9(9)V99 COMP-3.
+    05  FILLER           PIC X(47).
+```
+
+A program that processes mixed records reads `TXN-RECORD`, branches on
+`TXN-TYPE`, and then references `CUST-RECORD` or `VENDOR-RECORD`. No
+copying, no buffer juggling — just two names for the same 100 bytes.
+
+### Rules you must remember
+
+- **Same level number.** The `REDEFINES` item is at the same level as
+  the redefined.
+- **Same size or smaller.** The redefining item's total storage must
+  fit within the redefined item's storage. Larger is a compile error.
+- **No `VALUE` clause** on the REDEFINES item itself. (The one
+  exception: `88` condition names, which never have storage of their
+  own.)
+- **No level 01** REDEFINES in `WORKING-STORAGE`. In the `FILE
+  SECTION`, multiple 01-level records under a single `FD` describe
+  alternate buffer layouts implicitly — no `REDEFINES` keyword needed.
+- The **`OCCURS` and `REDEFINES` interact carefully:** an item being
+  redefined cannot itself contain `OCCURS DEPENDING ON` (the size has
+  to be known at redefine time).
+
+<Callout kind="warn" title="REDEFINES is not a cast">
+
+A common confusion from C-trained programmers: `REDEFINES` is not a
+type cast. It is two declarations of the same memory at compile time.
+There is no runtime "view switch." If you store packed-decimal bytes
+through one name and read display-numeric through the alias, you get
+the underlying bytes interpreted as display-numeric — including the
+S0C7 if those bytes are not valid digits.
+
+The maintainer skill is recognising when a `REDEFINES` is **safe by
+construction** (the writer always populates one name and reads the
+other in tandem) versus **a hazard** (one path writes the alias and
+another path reads the original, hoping the bytes line up).
+
+</Callout>
+
+### REDEFINES with 88 condition names
+
+The one place a REDEFINES item carries semantic meaning is condition
+names attached to a redefined record-type byte:
+
+```cobol
+01  TXN-RECORD.
+    05  TXN-TYPE         PIC X.
+        88  IS-CUSTOMER  VALUE "C".
+        88  IS-VENDOR    VALUE "V".
+        88  IS-EMPLOYEE  VALUE "E".
+    05  TXN-BODY         PIC X(99).
+```
+
+Then in the procedure division: `IF IS-CUSTOMER PERFORM HANDLE-CUST`.
+You will see this everywhere. The 88-levels live with the byte they
+describe, not with the REDEFINES that follow.
+
+## OCCURS — repeating groups
+
+`OCCURS n TIMES` declares a fixed-size table:
+
+```cobol
+01  STATE-TABLE.
+    05  STATE-ENTRY      OCCURS 50 TIMES.
+        10  STATE-CODE   PIC X(2).
+        10  STATE-NAME   PIC X(20).
+```
+
+Each `STATE-ENTRY` is 22 bytes (2 + 20). 50 entries means
+`STATE-TABLE` is **1100 bytes**. You access elements by subscript:
+`STATE-CODE(7)` is the 7th entry's two-byte code.
+
+COBOL subscripts are **1-based**. `STATE-CODE(0)` is undefined; on most
+implementations it reads the bytes immediately before the table. There
+is no compile-time check.
+
+### Subscripts vs indexes
+
+`INDEXED BY` declares an index variable that the compiler treats as
+a pre-multiplied byte offset:
+
+```cobol
+01  STATE-TABLE.
+    05  STATE-ENTRY      OCCURS 50 TIMES  INDEXED BY ST-IX.
+        10  STATE-CODE   PIC X(2).
+        10  STATE-NAME   PIC X(20).
+```
+
+You then `SET ST-IX TO 1`, `SET ST-IX UP BY 1`, and reference
+`STATE-CODE(ST-IX)`. The generated code is faster than a numeric
+subscript because no multiplication is needed at access time — the
+compiler already knows the entry size and adjusts the index by full
+entries.
+
+In practice: subscripts are easier to read; indexes are faster and are
+required for `SEARCH ALL` (covered in the next lesson).
+
+### Multi-dimensional tables
+
+`OCCURS` nests up to seven deep:
+
+```cobol
+01  GRID.
+    05  ROW              OCCURS 10 TIMES.
+        10  CELL         OCCURS 20 TIMES  PIC X(3).
+```
+
+`CELL(3, 7)` is the 7th cell of the 3rd row, 3 bytes. `GRID` is
+`10 * 20 * 3 = 600 bytes`. Subscripts are listed outside-in, the same
+order as the OCCURS clauses.
+
+## OCCURS DEPENDING ON — variable-length tables
+
+When the table size depends on data — a customer with 1 to 50 phone
+numbers, an order with 1 to 200 line items — `OCCURS DEPENDING ON`
+declares the bound dynamically:
+
+```cobol
+01  ORDER-RECORD.
+    05  ORDER-ID         PIC 9(8).
+    05  LINE-COUNT       PIC 9(3).
+    05  LINE-ITEM        OCCURS 1 TO 200 TIMES
+                         DEPENDING ON LINE-COUNT.
+        10  PROD-CODE    PIC X(8).
+        10  QUANTITY     PIC S9(5) COMP-3.
+        10  PRICE        PIC S9(7)V99 COMP-3.
+```
+
+`LINE-ITEM` is 17 bytes per entry (8 + 3 + 6). The total record size
+ranges from `8 + 3 + 17 = 28` bytes (one line) to
+`8 + 3 + 200 × 17 = 3411` bytes (max).
+
+<Diagram title="ODO record layout — concrete example with LINE-COUNT = 3">
+
+```
+offset  field             bytes
+   0    ORDER-ID            8       PIC 9(8)
+   8    LINE-COUNT          3       PIC 9(3) — value "003"
+  11    LINE-ITEM(1)       17       at offset 11
+  28    LINE-ITEM(2)       17       at offset 28
+  45    LINE-ITEM(3)       17       at offset 45
+  62    end of record
+```
+
+Total record length: 62 bytes (variable — 28 to 3411 depending on
+LINE-COUNT).
+
+</Diagram>
+
+A few hard-won truths:
+
+- **The file must be RECFM=V (variable) or VB.** Writing an ODO record
+  to a RECFM=F (fixed) file pads or truncates depending on the FD's
+  declared length. Reading wrong-RECFM is silent corruption, not an
+  ABEND.
+- **The DEPENDING ON field is consulted at access time.** If you change
+  `LINE-COUNT` mid-loop, subsequent subscripts use the new value. This
+  is a real bug pattern.
+- **Subscripts beyond the depending-on count are not bounds-checked**
+  by default. `LINE-ITEM(50)` when `LINE-COUNT = 3` reads whatever 17
+  bytes happen to follow. The data may even *look* valid right up
+  until the arithmetic.
+
+<Callout kind="warn" title="The SSRANGE compile option">
+
+`SSRANGE` (subscript range checking) inserts runtime bounds checks for
+every subscripted access. Out-of-range yields a clean, named ABEND
+with the failing subscript and table — instead of a silent S0C4 or
+silent corruption.
+
+It is **not free**: the inserted checks add overhead to every table
+access. Most production shops compile production with `NOSSRANGE`
+(performance) and test with `SSRANGE` (debuggability). When you are
+chasing a memory bug, *recompile the offending program with `SSRANGE`*
+and run the failing job again. You will know within seconds whether
+the bug is a subscript.
+
+</Callout>
+
+## A worked example: a payroll record
+
+Here is a copybook fragment that uses both clauses:
+
+```cobol
+01  PAYROLL-RECORD.
+    05  EMP-ID                PIC X(8).
+    05  EMP-NAME              PIC X(30).
+    05  PAY-TYPE              PIC X.
+        88  HOURLY             VALUE "H".
+        88  SALARIED           VALUE "S".
+
+    05  HOURLY-DETAILS.
+        10  HOURS-WORKED      PIC S9(5)V99 COMP-3.
+        10  HOURLY-RATE       PIC S9(5)V99 COMP-3.
+        10  OVERTIME-MULT     PIC 9V99       COMP-3.
+        10  FILLER            PIC X(8).
+
+    05  SALARY-DETAILS  REDEFINES  HOURLY-DETAILS.
+        10  ANNUAL-SALARY     PIC S9(9)V99   COMP-3.
+        10  PAY-PERIODS       PIC 9(3).
+        10  FILLER            PIC X(7).
+
+    05  DEDUCTION-COUNT       PIC 9(2).
+    05  DEDUCTION             OCCURS 0 TO 20 TIMES
+                              DEPENDING ON DEDUCTION-COUNT.
+        10  DEDUCT-CODE       PIC X(4).
+        10  DEDUCT-AMOUNT     PIC S9(7)V99   COMP-3.
+```
+
+Reading this:
+
+1. `EMP-ID`, `EMP-NAME`, `PAY-TYPE` are 39 bytes.
+2. `HOURLY-DETAILS` is 4 + 4 + 2 + 8 = **18 bytes** (the FILLER is
+   there to pad it out so SALARY-DETAILS fits).
+3. `SALARY-DETAILS` redefines those same 18 bytes: 6 + 3 + 7 + 2 = wait,
+   let's recount. `ANNUAL-SALARY` is `S9(9)V99 COMP-3` = `ceil((11+1)/2)
+   = 6` bytes. `PAY-PERIODS` is 3 bytes (PIC 9(3) zoned). `FILLER` is
+   7 bytes. **6 + 3 + 7 = 16 bytes — wait, that doesn't match.**
+
+A maintainer would catch this in code review: the FILLER under
+`SALARY-DETAILS` is mis-sized (should be 9, not 7) for the redefines
+to be the same size as `HOURLY-DETAILS`. If `SALARY-DETAILS` is
+strictly smaller, COBOL accepts it (smaller-or-equal rule), but the
+last 2 bytes of the underlying buffer are unaddressable through the
+SALARY-DETAILS name. **This is exactly the kind of bug that survives
+because the smaller side compiles cleanly.**
+
+Fixed copybook:
+
+```cobol
+05  SALARY-DETAILS  REDEFINES  HOURLY-DETAILS.
+    10  ANNUAL-SALARY     PIC S9(9)V99   COMP-3.   *> 6
+    10  PAY-PERIODS       PIC 9(3).                *> 3
+    10  FILLER            PIC X(9).                *> 9 — was 7
+```
+
+Now both shapes are 18 bytes and the underlying buffer is fully named
+under either view.
+
+The remaining record: `DEDUCTION-COUNT` is 2 bytes, then 0 to 20
+deduction entries of 4 + 6 = 10 bytes each. Min record: 39 + 18 + 2 =
+**59 bytes**. Max: 59 + 200 = **259 bytes**.
+
+This kind of careful size-counting is the maintainer's daily skill.
+
+## Lab: predict, then run
+
+The program below uses REDEFINES to inspect the byte representation
+of a packed-decimal value. Read it, predict what each DISPLAY shows,
+then run.
+
+<CodeLab
+  lessonId="cobol/data-layout/redefines-and-occurs"
+  runtime="server"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. REDEF-DEMO.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-AMOUNT       PIC S9(7)V99 COMP-3 VALUE 1234567.89.
+01  WS-AMOUNT-BYTES REDEFINES WS-AMOUNT  PIC X(5).
+01  WS-COUNT        PIC 9(2)             VALUE 3.
+01  WS-NUMBERS.
+    05  WS-NUM      OCCURS 5 TIMES       PIC 9(3) VALUE 0.
+PROCEDURE DIVISION.
+    DISPLAY "amount as packed-decimal display: " WS-AMOUNT.
+    DISPLAY "amount as 5-byte alphanumeric:    [" WS-AMOUNT-BYTES "]".
+    MOVE 100 TO WS-NUM(1).
+    MOVE 200 TO WS-NUM(2).
+    MOVE 300 TO WS-NUM(3).
+    DISPLAY "filled count: " WS-COUNT.
+    DISPLAY "WS-NUM(2)=" WS-NUM(2) ", WS-NUM(4)=" WS-NUM(4).
+    STOP RUN.`}
+  hints={[
+    "WS-AMOUNT is 5 bytes packed; WS-AMOUNT-BYTES gives you the raw bytes through a PIC X alias.",
+    "OCCURS 5 TIMES PIC 9(3) is 5 × 3 = 15 bytes total, all zero-initialized by VALUE 0.",
+    "The 4th element was never assigned but is still readable — it's the initialized zero."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/data-layout/redefines-and-occurs"
+  questions={[
+    {
+      prompt: "A 01-level group is 50 bytes. Can a REDEFINES of that group describe 60 bytes?",
+      options: [
+        { id: "a", label: "No — the redefining item must be the same size or smaller.", correct: true, explanation: "Modern COBOL requires the redefining item to fit." },
+        { id: "b", label: "Yes — REDEFINES allocates new storage for the larger size." },
+        { id: "c", label: "Yes — but only at level 01." },
+        { id: "d", label: "No — REDEFINES is illegal on group items." },
+      ],
+    },
+    {
+      prompt: "OCCURS 5 TIMES on a group whose unsubscripted size is 12 bytes. How big is the table?",
+      options: [
+        { id: "a", label: "12 bytes" },
+        { id: "b", label: "60 bytes", correct: true, explanation: "Fixed OCCURS allocates n × element-size." },
+        { id: "c", label: "17 bytes" },
+        { id: "d", label: "Depends on the data." },
+      ],
+    },
+    {
+      prompt: "WS-COUNT is 0 and the OCCURS is OCCURS 1 TO 100 DEPENDING ON WS-COUNT. What does CUST-TABLE(1) reference?",
+      options: [
+        { id: "a", label: "The first element, normally." },
+        { id: "b", label: "Undefined behavior — the table has zero elements.", correct: true, explanation: "ODO with the count at zero is logically empty. Production code checks the count before subscripting." },
+        { id: "c", label: "An automatic compile error." },
+        { id: "d", label: "An automatic S0C7." },
+      ],
+    },
+    {
+      prompt: "Without SSRANGE, what happens at runtime if you reference TABLE-ITEM(7) on a 5-element table?",
+      options: [
+        { id: "a", label: "S0C7 always." },
+        { id: "b", label: "S0C4 always." },
+        { id: "c", label: "Undefined: silent corruption, S0C4, or pure luck depending on what bytes follow.", correct: true, explanation: "No bounds check without SSRANGE." },
+        { id: "d", label: "Compile error." },
+      ],
+    },
+    {
+      prompt: "Which of these REDEFINES clauses is illegal?",
+      multi: true,
+      options: [
+        { id: "a", label: "05 ALT-DATE REDEFINES RAW-DATE PIC 9(8).", explanation: "Same-size REDEFINES, fine." },
+        { id: "b", label: "05 ALT-FIELD REDEFINES ORIG-FIELD PIC X(50) VALUE SPACES.", correct: true, explanation: "VALUE on a REDEFINES is illegal except for 88-levels." },
+        { id: "c", label: "05 ALT-COUNT REDEFINES ORIG-FIELD PIC X(50).", explanation: "Same-size, no VALUE — fine." },
+        { id: "d", label: "01 WORK-AREA REDEFINES STORAGE-AREA.", correct: true, explanation: "REDEFINES at level 01 in WORKING-STORAGE is illegal." },
+      ],
+    },
+  ]}
+/>
+
+## Up next
+
+The next lesson is **copybooks** — the `COPY` statement, library
+search rules, and the `REPLACING` clause that lets one copybook be
+reused for many fields. Copybooks are how every shop shares record
+layouts across hundreds of programs, and getting the search rules
+wrong is one of the most common production-incident causes.
