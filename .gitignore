@@ -23,3 +23,6 @@ infra/terraform/terraform.tfstate.backup
 infra/terraform/*.tfvars
 infra/terraform/.terraform.lock.hcl
 infra/terraform/keys/
+
+# Local git bundles produced for hand-off; not source of truth.
+*.bundle
