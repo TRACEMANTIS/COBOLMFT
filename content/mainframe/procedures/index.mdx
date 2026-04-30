@@ -1,0 +1,456 @@
+---
+module: jcl
+order: 2
+title: JCL procedures
+summary: PROCs — how shops package reusable JCL. Symbolic parameters, cataloged vs instream procedures, override syntax, and the convention of "thin invocation, thick PROC" that organises a real shop's batch library.
+estimatedMinutes: 28
+prerequisites: [what-is-zos, jcl-anatomy, dd-statements-deep]
+objectives:
+  - Read a PROC and the JCL that invokes it as a single unit.
+  - Substitute symbolic parameters and predict the resulting expanded JCL.
+  - Override individual DDs with stepname.ddname syntax.
+  - Distinguish cataloged procedures from instream procedures by purpose.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: A PROC defines //SYSIN DD * within step COMP. The invoking JCL has //COMP.SYSIN DD DSN=PROD.SOURCE,DISP=SHR. What dataset is used for SYSIN?
+      options:
+        - { id: a, label: "PROD.SOURCE — the override replaces the PROC's DD entirely.", correct: true, explanation: "stepname.ddname syntax substitutes the named DD in the named step. The PROC's original DD is discarded for that invocation. Used to point a generic PROC at a specific dataset." }
+        - { id: b, label: "Both — the override appends to the PROC's DD." }
+        - { id: c, label: "The PROC's DD wins because it's defined first." }
+        - { id: d, label: "It's a syntax error." }
+    - prompt: "&LIB is referenced in a PROC. What is &LIB at expansion time?"
+      options:
+        - { id: a, label: "A symbolic parameter — substituted with whatever value is passed via PROC=name,LIB=value or with the PROC's default if not overridden.", correct: true, explanation: "& prefix denotes a symbolic parameter. The PROC declares them in the PROC card with optional defaults. The invoking JCL passes values; the system substitutes textually before processing." }
+        - { id: b, label: "A literal ampersand-LIB string in the resulting JCL." }
+        - { id: c, label: "A reference to the LIBRARY system library." }
+        - { id: d, label: "An indication of GDG generation." }
+    - prompt: "Cataloged PROCs and instream PROCs — what's the structural difference?"
+      options:
+        - { id: a, label: "Cataloged PROCs live in a system PROC library (SYS1.PROCLIB or similar) and are referenced by name. Instream PROCs are defined in the JCL itself between // PROCNAME PROC and // PEND.", correct: true, explanation: "Cataloged is the long-term shape; instream is for one-off testing or for self-contained jobs. Behaviour at expansion is identical; the only difference is where the PROC text lives." }
+        - { id: b, label: "Cataloged are faster; instream are slower." }
+        - { id: c, label: "Instream PROCs cannot have symbolic parameters." }
+        - { id: d, label: "Cataloged PROCs run in their own address space." }
+    - prompt: '//STEP1   EXEC  COMPLINK,LIB=PROD.LOAD — assuming COMPLINK is a PROC, what does this expand to (conceptually)?'
+      options:
+        - { id: a, label: "The contents of COMPLINK's PROC are inserted with &LIB substituted by PROD.LOAD; the entire expanded set of steps runs as part of this job.", correct: true, explanation: "The PROC's steps are inserted at this point. From the operator's view in SDSF, the steps appear with prefixed names (COMPILE.STEP1.something or just the step names depending on JES2 verbosity)." }
+        - { id: b, label: "STEP1 calls COMPLINK as a subroutine; each program is invoked separately." }
+        - { id: c, label: "The PROC is loaded but not executed until a later EXEC." }
+        - { id: d, label: "A new job is submitted for COMPLINK." }
+    - prompt: 'Override: //COMPILE.SYSLIB DD DISP=SHR,DSN=PROD.COPYLIB plus default //SYSLIB DD DISP=SHR,DSN=SYS1.COPYLIB in the PROC. What is the SYSLIB at runtime?'
+      options:
+        - { id: a, label: "Just PROD.COPYLIB — the override REPLACES, not appends.", correct: true, explanation: "Without explicit concatenation in the override, the PROC's DD is discarded. To preserve concatenation, you list multiple DDs in the override." }
+        - { id: b, label: "Both, with PROD.COPYLIB first." }
+        - { id: c, label: "Both, with SYS1.COPYLIB first." }
+        - { id: d, label: "Override takes precedence only if // is removed." }
+---
+
+# JCL procedures
+
+A real shop's batch JCL is full of three-line jobs that invoke a PROC.
+The PROC is fifty cards of EXEC and DD statements that do the actual
+work. Reading the job alone gives you almost nothing; you read the
+PROC alongside, mentally substitute the parameters, and treat the
+combination as a single program. This lesson covers PROC syntax,
+symbolic parameters, override semantics, and the read-a-job-and-its-PROC
+methodology.
+
+## The basic shape
+
+A PROC looks much like a job:
+
+```jcl
+//* PROC: COMPLINK -- compile + link a COBOL source member
+//COMPLINK PROC LIB=PROD.LOAD,SOURCE=
+//*
+//COMPILE  EXEC PGM=IGYCRCTL,
+//             PARM='LIST,MAP,OFFSET,APOST,RENT'
+//STEPLIB  DD   DSN=PROD.COBOL.SIGYCOMP,DISP=SHR
+//SYSIN    DD   DSN=&SOURCE,DISP=SHR
+//SYSPRINT DD   SYSOUT=*
+//SYSLIN   DD   DSN=&&LOADSET,DISP=(NEW,PASS),
+//             SPACE=(CYL,(5,5)),UNIT=SYSDA
+//SYSLIB   DD   DSN=PROD.COPYLIB,DISP=SHR
+//SYSUT1   DD   UNIT=SYSDA,SPACE=(CYL,(5,5))
+//SYSUT2   DD   UNIT=SYSDA,SPACE=(CYL,(5,5))
+//*
+//LINK     EXEC PGM=IEWL,
+//             PARM='LIST,MAP,XREF,RENT,REUS,AMODE=31',
+//             COND=(0,LT,COMPILE)
+//SYSLIN   DD   DSN=&&LOADSET,DISP=(OLD,DELETE)
+//SYSLMOD  DD   DSN=&LIB,DISP=SHR
+//SYSPRINT DD   SYSOUT=*
+//SYSUT1   DD   UNIT=SYSDA,SPACE=(CYL,(5,5))
+//*
+//        PEND
+```
+
+Key elements:
+
+- `// COMPLINK PROC ...` — the PROC card declares the name and any
+  symbolic parameter defaults.
+- The `EXEC` and `DD` cards in between are the PROC's body.
+- `// PEND` ends an instream PROC. Cataloged PROCs (in SYS1.PROCLIB)
+  don't need PEND.
+
+`COMPLINK` here is a two-step PROC: `COMPILE` runs the COBOL compiler
+and produces a load-set; `LINK` link-edits it into a load module.
+
+## Symbolic parameters
+
+`&NAME` in a PROC is a placeholder. The PROC card declares them with
+optional defaults:
+
+```jcl
+//COMPLINK PROC LIB=PROD.LOAD,SOURCE=
+```
+
+- `LIB=PROD.LOAD` — default value `PROD.LOAD`.
+- `SOURCE=` — no default; the invoker must supply a value.
+
+The PROC then references them:
+
+```jcl
+//SYSIN    DD   DSN=&SOURCE,DISP=SHR
+//SYSLMOD  DD   DSN=&LIB,DISP=SHR
+```
+
+At expansion time, the system substitutes textually:
+
+- `DSN=&SOURCE` becomes whatever was passed for `SOURCE`.
+- `DSN=&LIB` becomes the passed `LIB` value, or `PROD.LOAD` if not
+  passed.
+
+### Invoking a PROC with parameters
+
+```jcl
+//STEP1    EXEC COMPLINK,
+//             SOURCE=PROD.COBOL.SOURCE(CUSTBL01),
+//             LIB=TEST.LOAD
+```
+
+After substitution, the job runs as if it had inlined the COMPLINK
+PROC with `&SOURCE` replaced by `PROD.COBOL.SOURCE(CUSTBL01)` and
+`&LIB` by `TEST.LOAD`.
+
+If `SOURCE` is not supplied, the PROC reference is rejected at JCL
+processing time — no default means it's required. If `LIB` is not
+supplied, the default `PROD.LOAD` is used.
+
+### Multi-character substitution
+
+Symbolic parameters can be embedded in larger expressions:
+
+```jcl
+*  In the PROC:
+//OUTPUT   DD   DSN=PROD.&JOBID..REPORT,DISP=...
+*  &JOBID..REPORT — the .. is escaping; first . terminates &JOBID,
+*  second . is a literal period
+```
+
+The `..` syntax is the escape for "this dot is part of the result, not
+a separator." This is one of those JCL gotchas that catches new
+maintainers — `&JOBID.REPORT` (single dot) would be parsed as
+`&JOBIDREPORT` (an undefined variable, since `.` ends the symbol).
+
+## Cataloged vs instream PROCs
+
+Two ways a PROC enters a job:
+
+### Cataloged
+
+The PROC is a member of a system PROC library — typically
+`SYS1.PROCLIB` or shop-specific equivalents listed in the JES2
+configuration. The job invokes by name:
+
+```jcl
+//STEP1    EXEC COMPLINK,SOURCE=...
+```
+
+JES2 looks up `COMPLINK` in the configured PROC libraries and
+substitutes the PROC's text. The job card looks innocent; the
+expansion is fifty lines.
+
+This is how production shops ship reusable batch components. The
+PROCs are change-controlled; jobs that invoke them are typically
+shorter than the PROCs.
+
+### Instream
+
+The PROC is defined in the JCL itself, with a `// PEND` to end it:
+
+```jcl
+//MYJOB   JOB ...
+//* Instream PROC for one-off use
+//MYPROC  PROC LIB=
+//STEP1   EXEC PGM=IEFBR14
+//DD1     DD  DSN=&LIB,DISP=SHR
+//        PEND
+//* Now invoke it
+//RUN1    EXEC MYPROC,LIB=PROD.MASTER
+```
+
+Instream PROCs are useful for ad-hoc jobs, for testing changes to a
+PROC before promoting it, and for self-contained training jobs. In
+production they're rare — the value of a PROC is reuse, and a
+one-job-only PROC has no reuse.
+
+## Overrides — substituting individual DDs
+
+The most common PROC interaction at runtime is **DD override**: the
+invoking JCL adds DD cards that replace specific DDs inside the PROC.
+
+```jcl
+//* Invoking the COMPLINK PROC, but with a different SYSLIB
+//STEP1    EXEC COMPLINK,SOURCE=PROD.COBOL.SOURCE(CUSTBL01)
+//COMPILE.SYSLIB DD DSN=TEST.COPYLIB,DISP=SHR
+//                  DD DSN=PROD.COPYLIB,DISP=SHR
+```
+
+Two things to read:
+
+- `COMPILE.SYSLIB` — qualified DDname. `COMPILE` is the step inside
+  the PROC; `SYSLIB` is the DD within that step. The override applies
+  to that specific DD in that specific step.
+- The two DDs after — concatenated. The PROC's original `SYSLIB`
+  pointing at `PROD.COPYLIB` is **discarded**; the override replaces
+  it with this concatenation.
+
+### Concatenation in overrides
+
+If the PROC has:
+
+```jcl
+//SYSLIB   DD   DSN=SYS1.COBLIB,DISP=SHR
+//         DD   DSN=PROD.COBLIB,DISP=SHR
+```
+
+(Two-DD concatenation, no DDname on the continuation.)
+
+And the override is:
+
+```jcl
+//COMPILE.SYSLIB DD DSN=TEST.COBLIB,DISP=SHR
+```
+
+Then at runtime, `SYSLIB` is just `TEST.COBLIB`. The PROC's
+concatenation is gone. To preserve plus-prepend, you'd write:
+
+```jcl
+//COMPILE.SYSLIB DD DSN=TEST.COBLIB,DISP=SHR
+//               DD DSN=SYS1.COBLIB,DISP=SHR
+//               DD DSN=PROD.COBLIB,DISP=SHR
+```
+
+Now `SYSLIB` is a 3-DD concatenation with `TEST` first. **Override
+replaces the entire DD definition** in the named step; you must
+re-list anything you want to keep.
+
+### Suppressing a DD
+
+Override with `DUMMY` or `DSN=NULLFILE`:
+
+```jcl
+//STEP1.OPTLOG DD DUMMY
+```
+
+This makes the PROC's `OPTLOG` a no-op for this invocation.
+
+## Reading a job + PROC together
+
+In SDSF, when a job runs, you can browse `JESJCL` to see the **expanded
+JCL** — the result of substituting parameters and applying overrides.
+This is the actual JCL that ran. For diagnostics, this is what you
+read; you do not separately reason about the PROC and the override.
+
+For static reading (before submission), the discipline is:
+
+1. Find the PROC. Its name is on the EXEC card; locate it in
+   `SYS1.PROCLIB` (or the shop's equivalent).
+2. Read the PROC, noting all symbolic parameters and their defaults.
+3. Look at the invoking JCL: which symbolic parameters does it pass,
+   and what are the values?
+4. Look at any overrides (`stepname.ddname` syntax), and predict
+   their effect on the corresponding DDs in the PROC.
+5. Mentally substitute everything to get the final JCL.
+
+After enough practice this becomes automatic — you scan a 5-line job
+card and a 50-card PROC and your brain synthesises the merged result.
+
+## A worked example
+
+The job:
+
+```jcl
+//PAYBL   JOB CLASS=A,MSGCLASS=X
+//RUN1    EXEC PAYRUN,
+//             EFFDATE=20260415,
+//             OUTLIB=PROD.PAYROLL.OUT
+//PAYBL010.CUSTMSTR DD DSN=PROD.CUST.MASTER,DISP=SHR
+//PAYBL010.SYSPRINT DD SYSOUT=*
+```
+
+The cataloged PROC `PAYRUN` (in SYS1.PROCLIB):
+
+```jcl
+//PAYRUN  PROC EFFDATE=,OUTLIB=
+//*
+//PAYBL010 EXEC PGM=PAYBL010,REGION=0M
+//STEPLIB  DD   DSN=PROD.LOAD,DISP=SHR
+//CUSTMSTR DD   DUMMY
+//OUTFILE  DD   DSN=&OUTLIB..PAYRUN(+1),
+//             DISP=(NEW,CATLG,DELETE),
+//             SPACE=(CYL,(500,250),RLSE),
+//             RECFM=FB,LRECL=120,BLKSIZE=0
+//SYSPRINT DD   SYSOUT=A
+//SYSUDUMP DD   SYSOUT=*
+//CEEDUMP  DD   SYSOUT=*
+//PARMIN   DD   *
+EFFECTIVE-DATE=&EFFDATE
+/*
+//*
+//PAYBL020 EXEC PGM=PAYBL020,COND=(0,LT,PAYBL010)
+//OUTFILE  DD   DSN=*.PAYBL010.OUTFILE,DISP=OLD
+//SYSPRINT DD   SYSOUT=*
+//        PEND
+```
+
+After expansion + overrides:
+
+- `PAYBL010` step:
+  - `STEPLIB` = `PROD.LOAD` (from PROC).
+  - `CUSTMSTR` = `PROD.CUST.MASTER` shared (override replaces the
+    PROC's `DUMMY`).
+  - `OUTFILE` = `PROD.PAYROLL.OUT.PAYRUN(+1)` (substitute `&OUTLIB`).
+  - `SYSPRINT` = `SYSOUT=*` (override changes class A to spool).
+  - `PARMIN` instream parameter contains `EFFECTIVE-DATE=20260415`.
+- `PAYBL020` step:
+  - `OUTFILE` = back-reference to `PAYBL010.OUTFILE` (the just-created
+    new GDG generation).
+  - Runs only if `PAYBL010` returned RC < 0 (i.e., succeeded).
+
+So the 5-line job (with two override DDs) expands into a 2-step
+production payroll run with substituted dates, output libraries, and
+the customer master pointed at the right dataset.
+
+## Common patterns
+
+| Pattern                                    | Why                                                |
+| ------------------------------------------ | -------------------------------------------------- |
+| Most production runs invoke a PROC          | Reusability and centralised change control          |
+| PROCs declare every parameter the caller might want to vary | Effective dates, libraries, debug levels, sysout classes |
+| Test JCL overrides STEPLIB to point at TEST.LOAD | Run prod-shape JCL against test code                |
+| One-off JCL uses instream PROCs            | Ad-hoc batch where the PROC is the job              |
+| Sort utilities use PROCs heavily            | Sort/merge/copy patterns are highly reusable        |
+
+## Lab: reasoning about a PROC
+
+There's no runnable COBOL for this lesson — PROCs are JCL artifacts.
+Instead, the lab is below: read the PROC and predict the expanded JCL
+from a given invocation.
+
+<CodeLab
+  lessonId="cobol/jcl/procedures"
+  runtime="server"
+  starter={`*  Pretend the PROC named MYPROC exists with this body:
+*
+*    //MYPROC  PROC LIB=PROD.LOAD,VERSION=01
+*    //STEP1   EXEC PGM=&LIB..&VERSION
+*    //SYSPRINT DD  SYSOUT=*
+*    //CUSTIN   DD  DUMMY
+*    //         PEND
+*
+*  And the invoking JCL is:
+*
+*    //RUN     EXEC MYPROC,LIB=TEST.LOAD,VERSION=02
+*    //STEP1.CUSTIN DD DSN=TEST.CUST.SAMPLE,DISP=SHR
+*
+*  After expansion the effective JCL is:
+*
+*    //STEP1   EXEC PGM=TEST.LOAD.02     <-- WRONG, see below
+*    //SYSPRINT DD  SYSOUT=*
+*    //CUSTIN   DD  DSN=TEST.CUST.SAMPLE,DISP=SHR
+*
+*  But wait: PGM=&LIB..&VERSION expands to PGM=TEST.LOAD.02, which
+*  is malformed. PGM expects a single program name, not a dataset
+*  name. The PROC author meant something like:
+*
+*    //STEP1   EXEC PGM=PAYBL01&VERSION,STEPLIB=&LIB
+*
+*  This program is a comment-only demonstration. It compiles to
+*  show that the lesson built cleanly, but the substantive content
+*  is the JCL reasoning above.
+
+IDENTIFICATION DIVISION.
+PROGRAM-ID. PROC-DEMO.
+PROCEDURE DIVISION.
+    DISPLAY "see comments above for JCL substitution exercise".
+    STOP RUN.`}
+  hints={[
+    "Track each symbolic parameter and its substitution.",
+    "Note that PROC DDs are replaced (not extended) by step-qualified overrides.",
+    "PROCs that look correct can have substitution bugs that only surface at submit time."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/jcl/procedures"
+  questions={[
+    {
+      prompt: "PROC has SYSIN DD *; invoking JCL has //COMP.SYSIN DD DSN=PROD.SOURCE,DISP=SHR. What's used?",
+      options: [
+        { id: "a", label: "PROD.SOURCE — override replaces.", correct: true, explanation: "stepname.ddname overrides replace the PROC's DD entirely." },
+        { id: "b", label: "Both — appended." },
+        { id: "c", label: "PROC's DD wins." },
+        { id: "d", label: "Syntax error." },
+      ],
+    },
+    {
+      prompt: "&LIB in a PROC is?",
+      options: [
+        { id: "a", label: "Symbolic parameter — substituted at expansion.", correct: true, explanation: "& prefix; substituted textually before processing." },
+        { id: "b", label: "Literal &LIB in result." },
+        { id: "c", label: "Reference to LIBRARY." },
+        { id: "d", label: "GDG indication." },
+      ],
+    },
+    {
+      prompt: "Cataloged vs instream PROCs?",
+      options: [
+        { id: "a", label: "Cataloged in SYS1.PROCLIB by name; instream defined inline with // PROCNAME PROC ... // PEND.", correct: true, explanation: "Same expansion behavior; different storage." },
+        { id: "b", label: "Cataloged faster." },
+        { id: "c", label: "Instream can't have parameters." },
+        { id: "d", label: "Cataloged runs in own address space." },
+      ],
+    },
+    {
+      prompt: "//STEP1 EXEC COMPLINK,LIB=PROD.LOAD — what happens?",
+      options: [
+        { id: "a", label: "PROC body is inserted with &LIB substituted; entire steps run as part of the job.", correct: true, explanation: "Inline expansion." },
+        { id: "b", label: "STEP1 calls COMPLINK as a subroutine." },
+        { id: "c", label: "Loaded but not executed." },
+        { id: "d", label: "New job submitted." },
+      ],
+    },
+    {
+      prompt: "Override replaces DD DISP=SHR,DSN=PROD.COPYLIB; PROC default is SYS1.COPYLIB. SYSLIB at runtime?",
+      options: [
+        { id: "a", label: "Just PROD.COPYLIB — override replaces, doesn't append.", correct: true, explanation: "Re-list the original DDs in the override to keep the concatenation." },
+        { id: "b", label: "Both, PROD first." },
+        { id: "c", label: "Both, SYS1 first." },
+        { id: "d", label: "Override only takes precedence if // is removed." },
+      ],
+    },
+  ]}
+/>
+
+## Up next
+
+The final lesson in this module is **conditions and restart** —
+`COND` parameters, `IF/THEN/ELSE/ENDIF`, return codes, and the
+discipline of designing a multi-step job so it can be restarted from
+any failed step without losing or duplicating work. The skill that
+turns a 2am page into "kick off the job from STEP030" instead of
+"the entire batch needs to rerun from scratch."
