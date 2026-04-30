@@ -1,0 +1,401 @@
+---
+module: data-layout
+order: 3
+title: Copybooks in production
+summary: How COBOL shares record layouts across hundreds of programs — the COPY statement, library search rules, REPLACING, and the versioning failure modes that cause real production incidents.
+estimatedMinutes: 28
+prerequisites: [hello-world, divisions, pic-and-comp3, redefines-and-occurs]
+objectives:
+  - Read a COPY statement and predict which library and which member is included.
+  - Use COPY REPLACING to share one copybook across multiple field prefixes.
+  - Recognise the versioning failure modes (stale copybook, library shadowing).
+  - Distinguish COPY (textual include) from CALL (runtime invocation).
+assessment:
+  kind: quiz
+  questions:
+    - prompt: "What does the COPY statement do at compile time?"
+      options:
+        - { id: a, label: "Textually inserts the copybook source into the program at the COPY point.", correct: true, explanation: "COPY is a preprocessor-style include. The compiler sees the merged source as if you had typed it inline. There is no runtime cost and no separate object." }
+        - { id: b, label: "Loads a precompiled binary at link time." }
+        - { id: c, label: "Generates a runtime CALL." }
+        - { id: d, label: "Imports symbols from another module." }
+    - prompt: "Two library DDs both contain a member named CUSTREC. Which one wins?"
+      options:
+        - { id: a, label: "The first one in the SYSLIB concatenation.", correct: true, explanation: "The compiler searches SYSLIB DDs in JCL order. The first member found wins. This is a real source of stale-copybook incidents — a leftover library on the front of the concatenation shadows the official one." }
+        - { id: b, label: "The most recently modified one." }
+        - { id: c, label: "The compile fails with a duplicate-member error." }
+        - { id: d, label: "Whichever the developer specifies with OF." }
+    - prompt: "COPY CUSTREC REPLACING ==:CUST:== BY ==CLIENT==. What changes?"
+      options:
+        - { id: a, label: "Every occurrence of the literal text :CUST: in CUSTREC is replaced with CLIENT before the copybook is included.", correct: true, explanation: "The :pseudo-text: delimiter REPLACING runs at COPY-expansion time. The included source has CLIENT wherever the original had :CUST:." }
+        - { id: b, label: "Only the first occurrence is replaced." }
+        - { id: c, label: "REPLACING runs at runtime against MOVE statements." }
+        - { id: d, label: "REPLACING fails — colons are not legal in pseudo-text delimiters." }
+    - prompt: "Which two of these are common copybook failure modes in production?"
+      multi: true
+      options:
+        - { id: a, label: "A program was recompiled but the compile pulled an old copybook from a development library that was still on the SYSLIB concatenation.", correct: true, explanation: "Library shadowing is the canonical stale-copybook bug. The fix is library hygiene — production compiles must use a known-clean SYSLIB." }
+        - { id: b, label: "The copybook source contains a runtime infinite loop." }
+        - { id: c, label: "A copybook was changed (a field grew by 2 bytes), but only some programs were recompiled. Programs running against the new file but compiled against the old copybook ABEND or read garbage.", correct: true, explanation: "This is the most expensive copybook bug. Coordinated recompiles are a maintenance discipline, not a feature of the language." }
+        - { id: d, label: "Copybooks consume runtime memory proportional to their size." }
+    - prompt: "DCLGEN-generated copybooks contain which two artifacts?"
+      multi: true
+      options:
+        - { id: a, label: "An SQL DECLARE TABLE statement (a comment to the compiler, used by precompiler validation).", correct: true, explanation: "DECLARE TABLE describes the table to the precompiler so it can validate column references." }
+        - { id: b, label: "A 01-level COBOL group with PIC clauses matching the DB2 column types.", correct: true, explanation: "The host-variable group is the actual storage the program uses for FETCH and INSERT." }
+        - { id: c, label: "An EXEC SQL CALL statement to load row data." }
+        - { id: d, label: "A runtime DB2 connection block." }
+---
+
+# Copybooks in production
+
+A real shop has hundreds of COBOL programs that all read the same
+files. The customer record is described in **one** place — a copybook —
+and every program that touches a customer record `COPY`s it. Change
+the layout in the copybook, recompile the affected programs, and they
+all agree on the new shape.
+
+That is the theory. The practice is more interesting: copybooks are a
+textual include mechanism, not a packaging system, which means they
+have all the failure modes that come with textual includes plus a few
+specific to mainframe development. This lesson covers what `COPY`
+actually does, how the library search works, the `REPLACING` clause
+that is more useful than it first appears, and the four or five
+recurring copybook bugs that show up in maintenance tickets.
+
+## What COPY does
+
+`COPY` is a compile-time directive. The compiler's preprocessor finds
+the named copybook in a library, opens the member, and inserts its
+text into your program at the `COPY` point. The compiler then
+processes the merged source as if you had typed it inline.
+
+```cobol
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-EOF-FLAG          PIC X     VALUE "N".
+           88  END-OF-FILE      VALUE "Y".
+
+       FILE SECTION.
+       FD  CUSTOMER-FILE.
+       01  CUSTOMER-RECORD.
+           COPY CUSTREC.
+```
+
+After expansion, the compile listing shows the copybook's text
+verbatim under the `01 CUSTOMER-RECORD.` line, prefixed with a marker
+(typically `C` in the indicator area) so you can tell what came from
+where.
+
+There is **no runtime cost** for `COPY`. There is no separate object
+file, no runtime symbol resolution, no link-step import. The merged
+source is what gets compiled. This is also why a copybook change
+requires recompiling every program that uses it — the included text
+is baked into each program's compiled output.
+
+<Callout kind="tip" title="COPY vs CALL — a vocabulary check">
+
+`COPY` includes source code at compile time.
+
+`CALL` invokes a separate program at run time.
+
+These are different mechanisms with different failure modes. A
+copybook bug surfaces at compile time (or, if the compile passes
+silently, the next time the file is read). A CALL bug surfaces at
+load or execution time as a "module not found" or a parameter
+mismatch. Maintainers frequently confuse them in incident postmortems.
+
+</Callout>
+
+## Library search rules
+
+The compiler finds copybooks via the **SYSLIB** DD concatenation in
+the compile JCL:
+
+```jcl
+//SYSLIB   DD  DISP=SHR,DSN=PROD.COPYLIB
+//         DD  DISP=SHR,DSN=PROJ.COMMON.COPYLIB
+//         DD  DISP=SHR,DSN=SYSTEM.SQL.COPYLIB
+```
+
+When a program says `COPY CUSTREC`, the preprocessor looks in the
+first DSN, then the second, then the third — **first match wins**.
+
+Two consequences:
+
+1. **Order matters.** Putting a development library on the front of
+   the concatenation in a production compile pulls dev versions of
+   every shadowed member.
+2. **Silent shadowing.** If `PROJ.COMMON.COPYLIB(CUSTREC)` exists but
+   `PROD.COPYLIB(CUSTREC)` also exists, only the prod one is used,
+   regardless of which is "newer."
+
+The `OF library-name` clause forces a specific library:
+
+```cobol
+COPY CUSTREC OF PROD-COPYLIB.
+```
+
+Here `PROD-COPYLIB` must be defined as a library in the
+`SPECIAL-NAMES` paragraph or the JCL. This is rare — most shops just
+manage SYSLIB ordering carefully — but `OF` is your tool when you
+need to disambiguate.
+
+## REPLACING — one copybook, many uses
+
+A common pattern: you want the same record layout twice in one
+program, with different field prefixes. `OLD-CUST-` for the existing
+state, `NEW-CUST-` for the proposed update. Without `REPLACING` you
+would maintain two separate copybooks. With `REPLACING`, you keep one:
+
+```cobol
+01  OLD-CUST.
+    COPY CUSTREC REPLACING ==:CUST:== BY ==OLD-CUST==.
+
+01  NEW-CUST.
+    COPY CUSTREC REPLACING ==:CUST:== BY ==NEW-CUST==.
+```
+
+If the copybook contains:
+
+```cobol
+05  :CUST:-ID            PIC X(8).
+05  :CUST:-NAME          PIC X(30).
+05  :CUST:-BAL           PIC S9(9)V99 COMP-3.
+```
+
+Then under `OLD-CUST` the fields are `OLD-CUST-ID`, `OLD-CUST-NAME`,
+`OLD-CUST-BAL`. Under `NEW-CUST` they are `NEW-CUST-ID` etc. The
+compiler does the textual substitution at COPY-expansion time, before
+the COBOL parser sees anything.
+
+The `==pseudo-text==` delimiters (two equals signs on each side) are
+the syntax for "this is text to match, including any spaces and
+punctuation." They are needed because the strings being replaced are
+not always valid COBOL words on their own (`:CUST:` is a placeholder
+convention, not a legal identifier). The `:colon-bracketed:` pattern
+inside the copybook is just one shop's convention; others use
+`%CUST%`, `&CUST&`, or `CUST`.
+
+You can also REPLACE with a list:
+
+```cobol
+COPY CUSTREC REPLACING
+    ==:CUST:==     BY ==NEW-CUST==
+    ==:LENGTH:==   BY ==30==.
+```
+
+Two consequences worth remembering:
+
+- The replacement is **string substitution**, not a parse. Replacing
+  `==CUST==` (no colons) by `==CLIENT==` would also rewrite
+  `CUSTOMER-ID` to `CLIENTOMER-ID`. Shops use distinctive placeholders
+  (`:CUST:`, `%CUST%`) for exactly this reason.
+- The replacement happens **before** the COBOL parser. The substituted
+  text must be syntactically valid COBOL where it lands. Replacing a
+  PIC clause length by a literal that breaks the field is a real bug
+  pattern.
+
+## DCLGEN — copybooks generated by DB2
+
+Embedded SQL programs (covered in a later module) use a tool called
+`DCLGEN` to generate a copybook from a DB2 table definition:
+
+```cobol
+*    *************************************************
+*    *  DCLGEN TABLE(MYDB.CUSTOMER)
+*    *  LIBRARY(PROD.SQL.COPYLIB(CUSTOMER))
+*    *  ACTION(REPLACE)
+*    *  QUOTE
+*    *************************************************
+     EXEC SQL DECLARE MYDB.CUSTOMER TABLE
+     ( CUST_ID            CHAR(8)         NOT NULL,
+       CUST_NAME          CHAR(30)        NOT NULL,
+       CUST_BAL           DECIMAL(11,2)   NOT NULL,
+       CUST_TIER          CHAR(1)
+     ) END-EXEC.
+
+     01 DCLCUSTOMER.
+        10 CUST-ID         PIC X(8).
+        10 CUST-NAME       PIC X(30).
+        10 CUST-BAL        PIC S9(9)V99 USAGE COMP-3.
+        10 CUST-TIER       PIC X(1).
+        10 CUST-TIER-IND   PIC S9(4)    USAGE COMP.
+```
+
+Two parts: the `EXEC SQL DECLARE TABLE` (a precompiler hint, ignored
+at compile time) and the host-variable `01` group (real storage that
+the program populates with `FETCH INTO :DCLCUSTOMER`).
+
+The `CUST-TIER-IND` halfword is a **null indicator** — DB2 nullable
+columns ship with a paired indicator variable. -1 means the column
+came back NULL; 0 means a real value. Programs that ignore null
+indicators are a major source of S0C7s when a NULL flows into
+arithmetic.
+
+## Versioning failures: the four classic bugs
+
+### 1. Stale copybook (recompile mismatch)
+
+A copybook is changed — `CUST-BAL` grows from `S9(7)V99` to
+`S9(9)V99` (5 bytes to 6, COMP-3). The shop coordinator recompiles 200
+of the 220 programs that use the copybook. Twenty are missed. Those
+twenty read records written by the new programs and either ABEND or
+silently produce wrong totals.
+
+The fix is process, not code: a recompile audit before promotion. The
+maintainer's job is to recognise the symptom — "this program was fine
+last week, the file was extended on Tuesday, and now it ABENDs on
+record N" — and check the compile date against the copybook's
+last-modified date.
+
+### 2. Library shadowing
+
+A new project added a copybook library to the front of the SYSLIB
+concatenation in the standard compile JCL — for testing — and forgot
+to remove it. Six months later that library still has stale members
+that are silently used by every production compile.
+
+The fix is library hygiene: production SYSLIB is locked, change-
+controlled, and reviewed.
+
+### 3. REPLACING that nearly worked
+
+A developer adds a new field to a copybook, forgets that the field
+name is also a PIC clause length elsewhere, and the REPLACING expands
+to invalid COBOL. The compile fails with a confusing error pointing at
+the REPLACING site, not at the conflict.
+
+The fix is to use distinctive placeholders (`:NAME:`, not `NAME`) and
+to read the post-expansion compile listing carefully.
+
+### 4. Stale DCLGEN
+
+The DBA changes a DB2 column from `CHAR(8)` to `CHAR(10)`. Programs
+with the old DCLGEN still describe the column as 8 bytes. `FETCH`s
+truncate; `INSERT`s pad. The errors are subtle because they only
+surface for rows where the difference matters.
+
+The fix is to regenerate DCLGEN whenever a table definition changes,
+and to recompile every program that uses the DCLGEN.
+
+<Callout kind="warn" title="The maintainer's first instinct">
+
+When a previously-working program starts ABENDing or returning
+strange values, ask immediately: *what changed in the copybooks
+this program depends on, and was this program recompiled afterwards?*
+
+The compile listing has the answer. Top of the listing is a copybook-
+expansion summary, including every member pulled in and which library
+it came from. That summary is the first place to look — before you
+read the code, before you study the dump.
+
+</Callout>
+
+## Lab: predict, then run
+
+The program below uses `COPY REPLACING` (simulated by inlining since
+the sandbox does not host a copybook library). It demonstrates the
+shape of a record layout shared between OLD and NEW prefixes.
+
+<CodeLab
+  lessonId="cobol/data-layout/copybooks"
+  runtime="server"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. COPY-DEMO.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+
+*  Imagine this 01 was: COPY CUSTREC REPLACING ==:CUST:== BY ==OLD-CUST==.
+01  OLD-CUST.
+    05  OLD-CUST-ID       PIC X(8)  VALUE "C0001234".
+    05  OLD-CUST-NAME     PIC X(20) VALUE "ALICE LEGACY".
+    05  OLD-CUST-BAL      PIC S9(7)V99 COMP-3 VALUE 1500.00.
+
+*  Imagine this 01 was: COPY CUSTREC REPLACING ==:CUST:== BY ==NEW-CUST==.
+01  NEW-CUST.
+    05  NEW-CUST-ID       PIC X(8).
+    05  NEW-CUST-NAME     PIC X(20).
+    05  NEW-CUST-BAL      PIC S9(7)V99 COMP-3.
+
+01  WS-DELTA              PIC S9(7)V99 COMP-3.
+
+PROCEDURE DIVISION.
+    MOVE OLD-CUST-ID    TO NEW-CUST-ID.
+    MOVE OLD-CUST-NAME  TO NEW-CUST-NAME.
+    COMPUTE NEW-CUST-BAL = OLD-CUST-BAL + 250.00.
+    COMPUTE WS-DELTA    = NEW-CUST-BAL - OLD-CUST-BAL.
+
+    DISPLAY "old: id=" OLD-CUST-ID " name=[" OLD-CUST-NAME "] bal=" OLD-CUST-BAL.
+    DISPLAY "new: id=" NEW-CUST-ID " name=[" NEW-CUST-NAME "] bal=" NEW-CUST-BAL.
+    DISPLAY "delta=" WS-DELTA.
+    STOP RUN.`}
+  hints={[
+    "Both 01-levels share the same field shapes — that's what COPY REPLACING gives you in real life: one source, two prefixes.",
+    "The field types must be identical for the MOVEs to work; this is by design.",
+    "Inlining one copybook in two places, with different prefixes, is the maintainer-friendly way to express 'before and after' state."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/data-layout/copybooks"
+  questions={[
+    {
+      prompt: "What does the COPY statement do at compile time?",
+      options: [
+        { id: "a", label: "Textually inserts the copybook source into the program at the COPY point.", correct: true, explanation: "COPY is a preprocessor-style include." },
+        { id: "b", label: "Loads a precompiled binary at link time." },
+        { id: "c", label: "Generates a runtime CALL." },
+        { id: "d", label: "Imports symbols from another module." },
+      ],
+    },
+    {
+      prompt: "Two library DDs both contain a member named CUSTREC. Which one wins?",
+      options: [
+        { id: "a", label: "The first one in the SYSLIB concatenation.", correct: true, explanation: "First match wins. Library shadowing is a real source of stale-copybook incidents." },
+        { id: "b", label: "The most recently modified one." },
+        { id: "c", label: "The compile fails with a duplicate-member error." },
+        { id: "d", label: "Whichever the developer specifies with OF." },
+      ],
+    },
+    {
+      prompt: "COPY CUSTREC REPLACING ==:CUST:== BY ==CLIENT==. What changes?",
+      options: [
+        { id: "a", label: "Every occurrence of :CUST: in CUSTREC is replaced with CLIENT before the copybook is included.", correct: true, explanation: "Pseudo-text REPLACING runs at COPY-expansion time." },
+        { id: "b", label: "Only the first occurrence is replaced." },
+        { id: "c", label: "REPLACING runs at runtime against MOVE statements." },
+        { id: "d", label: "REPLACING fails — colons are not legal in pseudo-text delimiters." },
+      ],
+    },
+    {
+      prompt: "Which two of these are common copybook failure modes in production?",
+      multi: true,
+      options: [
+        { id: "a", label: "A program was recompiled but the compile pulled an old copybook from a stale dev library still on SYSLIB.", correct: true, explanation: "Library shadowing." },
+        { id: "b", label: "The copybook source contains a runtime infinite loop." },
+        { id: "c", label: "A copybook field grew by 2 bytes; only some programs were recompiled. Programs reading new files with old copybooks ABEND or read garbage.", correct: true, explanation: "Stale-copybook recompile mismatch." },
+        { id: "d", label: "Copybooks consume runtime memory proportional to their size." },
+      ],
+    },
+    {
+      prompt: "DCLGEN-generated copybooks contain which two artifacts?",
+      multi: true,
+      options: [
+        { id: "a", label: "An SQL DECLARE TABLE statement for the precompiler.", correct: true, explanation: "Lets the precompiler validate column references." },
+        { id: "b", label: "A 01-level group with PIC clauses matching the column types.", correct: true, explanation: "Real host-variable storage for FETCH and INSERT." },
+        { id: "c", label: "An EXEC SQL CALL statement to load row data." },
+        { id: "d", label: "A runtime DB2 connection block." },
+      ],
+    },
+  ]}
+/>
+
+## Up next
+
+The next lesson is **tables and SEARCH** — the access patterns that
+turn an OCCURS into a useful lookup. Linear `SEARCH`, binary `SEARCH
+ALL`, the `SET` and key-clause discipline that makes `SEARCH ALL`
+correct, and the performance reality that decides which to reach for
+in production code.
