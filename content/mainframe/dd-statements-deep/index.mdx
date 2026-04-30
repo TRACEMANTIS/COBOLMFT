@@ -1,0 +1,440 @@
+---
+module: jcl
+order: 1
+title: DD statements deep
+summary: The parameters that turn a DD card into a working dataset reference — DSN, DISP, SPACE, RECFM, LRECL, BLKSIZE, UNIT, VOL — and the small set of patterns that account for 95% of what you'll read in production JCL.
+estimatedMinutes: 30
+prerequisites: [what-is-zos, jcl-anatomy]
+objectives:
+  - Read a DD statement and predict whether the dataset is cataloged, temporary, new, or shared.
+  - Decode DISP and predict what happens at step start, normal end, and abnormal end.
+  - Choose RECFM, LRECL, and BLKSIZE for a new dataset and explain why each matters.
+  - Recognise common DD patterns (SYSOUT, DUMMY, instream, GDG, temp).
+assessment:
+  kind: quiz
+  questions:
+    - prompt: "DISP=(NEW,CATLG,DELETE) — what happens at each step boundary?"
+      options:
+        - { id: a, label: "Step start: dataset is created. Normal end: dataset is cataloged. ABEND end: dataset is deleted.", correct: true, explanation: "DISP has three positions: status (NEW/OLD/SHR/MOD), normal-end (KEEP/DELETE/PASS/CATLG/UNCATLG), abnormal-end (KEEP/DELETE/CATLG/UNCATLG). NEW means create; CATLG on normal end registers it in the system catalog; DELETE on abnormal cleans up." }
+        - { id: b, label: "Step start: dataset is opened in shared mode." }
+        - { id: c, label: "Step start: nothing; only normal end matters." }
+        - { id: d, label: "All three only fire if the previous step's RC was 0." }
+    - prompt: "DISP=(OLD,KEEP) — what does this give you for an existing dataset?"
+      options:
+        - { id: a, label: "Exclusive access for the duration of the step; the dataset is preserved at end.", correct: true, explanation: "OLD = exclusive access (only this step has it; other concurrent jobs wait or fail with FILE STATUS 93). KEEP at normal end means the dataset stays cataloged. Use OLD for steps that update the dataset. Use SHR (shared) for read-only steps." }
+        - { id: b, label: "Shared (concurrent) access." }
+        - { id: c, label: "Read-only access with no locks." }
+        - { id: d, label: "OLD means the dataset is replaced at step start." }
+    - prompt: "RECFM=FB, LRECL=80, BLKSIZE=27920 — what does this describe?"
+      options:
+        - { id: a, label: "Fixed-block records of 80 bytes each, blocked into 27920-byte physical blocks (349 records per block).", correct: true, explanation: "FB = fixed length, blocked. LRECL is the logical record length (80 here, classic card-image). BLKSIZE is the physical I/O unit; 27920 / 80 = 349 records per block — close to a half-track on 3390 DASD. BLKSIZE=0 lets the system choose optimally; modern shops nearly always use 0." }
+        - { id: b, label: "Variable-length records up to 80 bytes." }
+        - { id: c, label: "A spanned dataset with 80 records per block." }
+        - { id: d, label: "An undefined-format dataset with metadata blocks." }
+    - prompt: "//SORTOUT  DD  DSN=&&TEMPSORT,DISP=(NEW,PASS),SPACE=(CYL,(50,10)) — what does the && do?"
+      options:
+        - { id: a, label: "Marks the dataset as temporary — exists only for the life of the job and is not in any catalog.", correct: true, explanation: "&& prefix denotes a temporary dataset. The system creates a uniquely-named temp dataset and uses it during the job. PASS at normal end keeps it allocated for downstream steps in the same job. It vanishes at job end regardless of disposition." }
+        - { id: b, label: "Marks the dataset as a job library." }
+        - { id: c, label: "Indicates a private VSAM cluster." }
+        - { id: d, label: "Substitutes a symbolic parameter at runtime." }
+    - prompt: Which two of these are common DUMMY DD use cases?
+      multi: true
+      options:
+        - { id: a, label: "Suppressing a DD that the program OPENs but doesn't actually need to populate (the read returns end-of-file immediately).", correct: true, explanation: "DUMMY satisfies the OPEN/READ contract; READ returns AT END instantly. Used when a program is shared between paths that need the file and paths that don't." }
+        - { id: b, label: "Discarding a program's output (DUMMY makes WRITE a no-op).", correct: true, explanation: "DUMMY also no-ops WRITE — useful for testing or for steps that produce optional output that you want to skip." }
+        - { id: c, label: "Forcing the program to abort on OPEN." }
+        - { id: d, label: "Allocating a 0-byte dataset for monitoring." }
+---
+
+# DD statements deep
+
+A DD (Data Definition) statement names a file the program will use,
+points it at a dataset, and tells the system what to do with the
+dataset before, during, and after the step. Most JCL bugs are DD bugs:
+wrong DSN, wrong DISP, wrong RECFM. This lesson is the parameter
+reference and the set of patterns that account for nearly everything
+you'll see in production.
+
+## The shape of a DD
+
+```jcl
+//CUSTFILE DD  DSN=PROD.CUST.MASTER,
+//             DISP=SHR,
+//             RECFM=FB,
+//             LRECL=120,
+//             BLKSIZE=0
+```
+
+- `//CUSTFILE` — the **DDname**, matched to the program's `ASSIGN`.
+- `DD` — the card type.
+- The rest — parameters, comma-separated, continued onto multiple
+  cards by ending each line with a comma.
+
+The DDname is what the COBOL program references. The DSN is what z/OS
+references in the catalog.
+
+## DSN — the dataset name
+
+`DSN=` (or `DSNAME=`) is the dataset's catalog name. Conventional
+shops use a hierarchical naming scheme:
+
+```
+PROD.CUST.MASTER             ← production master
+PROD.CUST.MASTER.G0042V00    ← GDG generation
+SYS1.PROCLIB                 ← system PROC library
+USER01.TEST.JCL              ← user dataset
+&&TEMPWORK                   ← temporary (job-local)
+```
+
+Conventions vary, but you'll see the high-level qualifier (HLQ) used
+to designate ownership/environment (`PROD`, `TEST`, `SYS1`, individual
+user IDs). Shops have firm rules about which HLQs are production,
+which are dev, which need RACF authority. **Look at the HLQ first** —
+it tells you the dataset's role.
+
+### Special DSN forms
+
+- `DSN=&&temp` — temporary, job-local dataset.
+- `DSN=*.STEP1.OUTFILE` — back-reference to another step's DD.
+- `DSN=PROD.MYGDG(0)` — current GDG generation.
+- `DSN=PROD.MYGDG(+1)` — next (new) GDG generation.
+- `DSN=PROD.MYGDG(-1)` — previous (older) generation.
+
+GDG (Generation Data Group) syntax is its own topic; the brief version
+is that a GDG is a series of dataset generations sharing a base name,
+and the relative number selects which one.
+
+## DISP — disposition
+
+`DISP=(status,normal-end,abnormal-end)`. Three positions:
+
+### Status (first position)
+
+| Value | Meaning                                                        |
+| ----- | -------------------------------------------------------------- |
+| `NEW` | Create the dataset. SPACE parameter required.                   |
+| `OLD` | Exclusive access to an existing dataset. Other jobs wait.       |
+| `SHR` | Shared access to an existing dataset. Multiple readers OK.      |
+| `MOD` | OLD if the dataset exists, append to end; NEW if not.           |
+
+### Normal-end (second position)
+
+| Value     | Meaning                                                   |
+| --------- | --------------------------------------------------------- |
+| `KEEP`    | Leave the dataset on disk; do not catalog if not already. |
+| `DELETE`  | Erase the dataset.                                         |
+| `PASS`    | Pass to a later step in the same job (job-local).          |
+| `CATLG`   | Catalog the dataset (newly created datasets are usually). |
+| `UNCATLG` | Remove from catalog but leave on disk.                    |
+
+### Abnormal-end (third position)
+
+Same values as normal-end. Fires only if the step ABENDs.
+
+### Common patterns
+
+```jcl
+DISP=SHR                   *> read-only existing dataset
+DISP=OLD                   *> read/write existing, exclusive
+DISP=(NEW,CATLG,DELETE)    *> create, catalog on success, clean up on abend
+DISP=(NEW,PASS)            *> create, pass to next step (temp use)
+DISP=(MOD,KEEP)            *> append to existing log file, keep
+```
+
+`DISP=SHR` for read-only is the most common; **using `OLD` for a
+read-only step is a real bug** because it locks the dataset against
+concurrent jobs unnecessarily. Watch for this in legacy JCL.
+
+If only the first position is given (`DISP=SHR`), the second defaults
+to `KEEP` for existing datasets and `DELETE` for new.
+
+## SPACE — allocating new datasets
+
+For `NEW` datasets, you must declare the space:
+
+```jcl
+SPACE=(CYL,(50,10),RLSE)
+```
+
+- `CYL` — units. Alternatives: `TRK` (tracks), `BLK` (blocks).
+- `(50,10)` — primary, secondary. Initial 50 cylinders, then 10 more
+  when needed (up to 15 secondary extensions on most DASD).
+- `RLSE` — release unused space at close.
+
+Common SPACE patterns:
+
+```jcl
+SPACE=(CYL,(10,5),RLSE)             *> small dataset, ~10 cyl
+SPACE=(CYL,(100,50),RLSE)           *> medium
+SPACE=(CYL,(500,250),RLSE)          *> large
+SPACE=(TRK,(15,5,10),RLSE)          *> partitioned (PDS): 10 directory blocks
+```
+
+For PDS/PDSE (libraries with members) the third element of the inner
+list is the directory block count. PDSE is the modern replacement —
+similar SPACE shape, more reliable.
+
+The maintainer's instinct: when a job ABENDs with `B37` or `D37`
+(out-of-space), the SPACE parameter is too small for the data the job
+is producing. Increase primary, or increase secondary, or both.
+
+## RECFM, LRECL, BLKSIZE — record format
+
+These three parameters describe the dataset's physical layout:
+
+### RECFM — record format
+
+| Value  | Meaning                                                        |
+| ------ | -------------------------------------------------------------- |
+| `F`    | Fixed-length, unblocked (one logical record per physical block) |
+| `FB`   | Fixed-length, blocked (multiple records per block)              |
+| `V`    | Variable-length, unblocked                                       |
+| `VB`   | Variable-length, blocked                                         |
+| `U`    | Undefined (catch-all; uncommon outside utility datasets)         |
+| `FBA`  | Fixed-block with ANSI carriage control                           |
+| `VBA`  | Variable-block with ANSI carriage control                        |
+
+For COBOL data files: nearly always `FB` (fixed records, sequential)
+or `VB` (records of varying length, common with `OCCURS DEPENDING
+ON`). Match the program's record description to the file's RECFM —
+mismatch produces FILE STATUS 04 (record length wrong) or 39 (RECFM
+incompatible).
+
+### LRECL — logical record length
+
+The program's record length, in bytes:
+
+```jcl
+RECFM=FB,LRECL=120     *> 120-byte records
+RECFM=VB,LRECL=2004    *> max 2000 bytes plus 4-byte length prefix
+```
+
+For RECFM=V/VB, the LRECL is the **maximum** record length, including
+the 4-byte block descriptor word.
+
+### BLKSIZE — physical block size
+
+The unit of physical I/O. Larger blocks mean fewer I/Os and faster
+sequential reads, up to a sensible limit:
+
+```jcl
+RECFM=FB,LRECL=120,BLKSIZE=0          *> system-determined (recommended)
+RECFM=FB,LRECL=120,BLKSIZE=27840      *> classic half-track on 3390 (232 records)
+```
+
+`BLKSIZE=0` lets the system pick an optimal value based on the device
+(half-track or full-track). **Modern shops nearly always use 0.**
+Hardcoded values appear in legacy JCL as historical artifact.
+
+## UNIT and VOL — physical placement
+
+`UNIT` declares the device class:
+
+```jcl
+UNIT=SYSDA              *> any DASD pool the installation has named SYSDA
+UNIT=TAPE               *> tape drive
+UNIT=3390               *> specific device type
+```
+
+`VOL=SER=volser` pins to a specific volume:
+
+```jcl
+DSN=USER01.PRIVATE.JCL,VOL=SER=PRV001,UNIT=3390
+```
+
+Most production JCL uses neither — the catalog already knows where the
+dataset lives, and SMS (system-managed storage) places new datasets
+automatically. You'll see UNIT/VOL in older code and in special-purpose
+allocations.
+
+## SYSOUT — print classes
+
+```jcl
+//SYSPRINT DD  SYSOUT=*
+//REPORT   DD  SYSOUT=A
+```
+
+`SYSOUT=*` routes the output to the same class the job is using (set
+by `MSGCLASS=` on the JOB card). Specific classes (A, X, Z, etc.) route
+to specific spool destinations; the conventions are shop-dependent.
+
+`SYSOUT=*` for `SYSPRINT` (compile or sort messages) and `SYSPRINT`
+for runtime DISPLAYs is the most common pattern — they end up in the
+job's spool, viewable in SDSF.
+
+## DUMMY — null I/O
+
+```jcl
+//OPTLOG DD  DUMMY
+```
+
+The program can `OPEN`, `READ`, `WRITE` and so on, but:
+
+- `READ` returns AT END immediately (the file is empty).
+- `WRITE` is a no-op.
+
+Use cases:
+
+- A program is shared between callers that need to write a log and
+  callers that don't. Pointing the optional log DD at `DUMMY` skips
+  it.
+- Test runs that want to suppress real output.
+- Debugging — point the output DD at DUMMY to see if the rest of the
+  program runs without I/O.
+
+## A worked DD: the customer master
+
+```jcl
+//CUSTMSTR DD  DSN=PROD.CUST.MASTER,
+//             DISP=SHR
+//
+//CUSTNEW  DD  DSN=PROD.CUST.MASTER.NEW(+1),
+//             DISP=(NEW,CATLG,DELETE),
+//             SPACE=(CYL,(500,250),RLSE),
+//             RECFM=FB,
+//             LRECL=120,
+//             BLKSIZE=0
+//
+//CUSTBAD  DD  DSN=&&BADCUST,
+//             DISP=(NEW,PASS),
+//             SPACE=(CYL,(10,5),RLSE),
+//             RECFM=FB,
+//             LRECL=120,
+//             BLKSIZE=0
+//
+//SYSPRINT DD  SYSOUT=*
+//SYSUDUMP DD  SYSOUT=*
+//CEEDUMP  DD  SYSOUT=*
+```
+
+Read it:
+
+- `CUSTMSTR`: existing production master; shared (read-only) access.
+- `CUSTNEW`: new GDG generation `(+1)`; created, cataloged on success,
+  cleaned up on ABEND. 500 cylinders primary, 250 secondary. RECFM=FB,
+  120-byte records, system-chosen blocksize.
+- `CUSTBAD`: temporary error-record file (`&&BADCUST`); passed to a
+  later step for analysis; gone at job end.
+- `SYSPRINT/SYSUDUMP/CEEDUMP`: DISPLAY output and dump output go to
+  the spool.
+
+This pattern — read-shared input, new-cataloged-with-cleanup output,
+temp scratchpad, dump destinations — is what 90% of batch JCL looks
+like. Memorise it.
+
+## Lab: read a DD card
+
+There's no runnable COBOL for this lesson (the COBOL doesn't see DD
+parameters; the runtime does). The lab is below — read the JCL and
+predict its behavior.
+
+<CodeLab
+  lessonId="cobol/jcl/dd-statements-deep"
+  runtime="server"
+  starter={`*  This is a COBOL program that uses three files. The DD statements
+*  for each file would look like the JCL described in the comments
+*  below.
+
+IDENTIFICATION DIVISION.
+PROGRAM-ID. DD-DEMO.
+ENVIRONMENT DIVISION.
+INPUT-OUTPUT SECTION.
+FILE-CONTROL.
+*  CUSTMSTR will be: DSN=PROD.CUST.MASTER, DISP=SHR
+    SELECT CUST-MASTER ASSIGN TO CUSTMSTR
+        FILE STATUS IS WS-MSTR-STATUS.
+*  CUSTNEW will be: DSN=PROD.CUST.MASTER.NEW(+1),
+*                   DISP=(NEW,CATLG,DELETE),
+*                   SPACE=(CYL,(500,250),RLSE),
+*                   RECFM=FB, LRECL=120, BLKSIZE=0
+    SELECT CUST-OUTPUT ASSIGN TO CUSTNEW
+        FILE STATUS IS WS-NEW-STATUS.
+*  ERRLOG will be: DUMMY (no-op output)
+    SELECT ERR-LOG ASSIGN TO ERRLOG
+        FILE STATUS IS WS-ERR-STATUS.
+
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-MSTR-STATUS  PIC X(2).
+01  WS-NEW-STATUS   PIC X(2).
+01  WS-ERR-STATUS   PIC X(2).
+
+PROCEDURE DIVISION.
+*  In a real run with the JCL above:
+*    OPEN INPUT  CUST-MASTER     - succeeds (DISP=SHR on existing)
+*    OPEN OUTPUT CUST-OUTPUT     - allocates new GDG generation
+*    OPEN OUTPUT ERR-LOG         - succeeds (DUMMY)
+*    WRITE to ERR-LOG            - silently no-op (DUMMY)
+
+    DISPLAY "this program demonstrates DD card behavior".
+    DISPLAY "actual file ops require a real z/OS environment;".
+    DISPLAY "the JCL comments above describe expected behavior.".
+    STOP RUN.`}
+  hints={[
+    "GnuCOBOL doesn't model z/OS DD semantics — the actual behavior described in the comments only manifests in a real z/OS run.",
+    "What you can verify: the SELECT/ASSIGN syntax, that the program compiles cleanly, and that the program structure matches typical batch I/O.",
+    "Read the comments as if they were a real JCL fragment and predict each OPEN's outcome."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/jcl/dd-statements-deep"
+  questions={[
+    {
+      prompt: "DISP=(NEW,CATLG,DELETE) — step boundary behavior?",
+      options: [
+        { id: "a", label: "Start: create. Normal end: catalog. ABEND end: delete.", correct: true, explanation: "Three-position DISP." },
+        { id: "b", label: "Start: open shared." },
+        { id: "c", label: "Start: nothing; only normal end matters." },
+        { id: "d", label: "All three only fire if previous step RC=0." },
+      ],
+    },
+    {
+      prompt: "DISP=(OLD,KEEP)?",
+      options: [
+        { id: "a", label: "Exclusive access; preserved at end.", correct: true, explanation: "OLD = exclusive lock. SHR = shared. Use SHR for read-only." },
+        { id: "b", label: "Shared access." },
+        { id: "c", label: "Read-only no locks." },
+        { id: "d", label: "Replace at start." },
+      ],
+    },
+    {
+      prompt: "RECFM=FB, LRECL=80, BLKSIZE=27920?",
+      options: [
+        { id: "a", label: "Fixed 80-byte records, 27920-byte blocks (349/block).", correct: true, explanation: "Classic half-track on 3390. BLKSIZE=0 lets system optimise." },
+        { id: "b", label: "Variable up to 80 bytes." },
+        { id: "c", label: "Spanned with 80 records/block." },
+        { id: "d", label: "Undefined format." },
+      ],
+    },
+    {
+      prompt: "DSN=&&TEMPSORT — what does && mean?",
+      options: [
+        { id: "a", label: "Temporary dataset, job-local, vanishes at job end.", correct: true, explanation: "Job-local temp; PASS keeps it across steps in the same job." },
+        { id: "b", label: "Job library marker." },
+        { id: "c", label: "Private VSAM cluster." },
+        { id: "d", label: "Symbolic parameter." },
+      ],
+    },
+    {
+      prompt: "Which two are common DUMMY DD use cases?",
+      multi: true,
+      options: [
+        { id: "a", label: "Suppress an optional input — READ returns AT END immediately.", correct: true, explanation: "OPEN/READ contract is satisfied; nothing to read." },
+        { id: "b", label: "Discard output — WRITE is a no-op.", correct: true, explanation: "Useful for testing or genuinely-optional output." },
+        { id: "c", label: "Force OPEN to abort." },
+        { id: "d", label: "Allocate 0-byte dataset for monitoring." },
+      ],
+    },
+  ]}
+/>
+
+## Up next
+
+The next lesson is **procedures** — how shops package reusable JCL as
+PROCs, the symbolic-parameter syntax, and the override conventions
+that let one PROC be tuned per invocation. Procedures are the
+mainframe's analog of shell-script wrapping: a 3-line job invokes a
+50-card cataloged PROC, and you read both to understand what runs.
