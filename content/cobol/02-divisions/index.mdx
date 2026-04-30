@@ -1,0 +1,82 @@
+---
+module: fundamentals
+order: 2
+title: The four divisions
+summary: Where each construct lives — IDENTIFICATION, ENVIRONMENT, DATA, PROCEDURE.
+estimatedMinutes: 12
+prerequisites: [hello-world]
+objectives:
+  - Place each construct in the correct division.
+  - Read a copybook reference and know which division it's pulled into.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: Where does FILE-CONTROL live?
+      options:
+        - { id: a, label: IDENTIFICATION DIVISION }
+        - { id: b, label: "ENVIRONMENT DIVISION (INPUT-OUTPUT SECTION)", correct: true, explanation: "FILE-CONTROL pairs file names with external dataset names. It belongs to the ENVIRONMENT DIVISION." }
+        - { id: c, label: DATA DIVISION }
+        - { id: d, label: PROCEDURE DIVISION }
+    - prompt: Where do you declare a 01-level group item?
+      options:
+        - { id: a, label: IDENTIFICATION DIVISION }
+        - { id: b, label: ENVIRONMENT DIVISION }
+        - { id: c, label: "DATA DIVISION (WORKING-STORAGE SECTION or LINKAGE SECTION)", correct: true, explanation: "Group items live in WORKING-STORAGE for program-local data, LINKAGE for parameters, or FILE SECTION for record buffers." }
+        - { id: d, label: PROCEDURE DIVISION }
+    - prompt: Which two of these statements live in the PROCEDURE DIVISION?
+      multi: true
+      options:
+        - { id: a, label: PERFORM, correct: true, explanation: "PERFORM is a procedural verb." }
+        - { id: b, label: PIC, explanation: "PIC is a clause attached to a DATA item, not a verb." }
+        - { id: c, label: STOP RUN, correct: true, explanation: "STOP RUN ends execution." }
+        - { id: d, label: PROGRAM-ID, explanation: "PROGRAM-ID is metadata in IDENTIFICATION." }
+---
+
+# The four divisions
+
+A COBOL program is rigidly partitioned. Knowing which division owns
+which construct is the fastest way to read unfamiliar code.
+
+| Division        | What lives here                                              |
+| --------------- | ------------------------------------------------------------ |
+| IDENTIFICATION  | `PROGRAM-ID`, author/date metadata                           |
+| ENVIRONMENT     | `FILE-CONTROL`, special-names, configuration                 |
+| DATA            | `WORKING-STORAGE`, `LINKAGE`, `FILE SECTION`, copybooks      |
+| PROCEDURE       | every executable verb: `PERFORM`, `MOVE`, `IF`, `CALL`, etc. |
+
+Copybooks (the COBOL equivalent of `#include`) are usually pulled into
+the DATA DIVISION via `COPY` and rarely into the PROCEDURE DIVISION.
+
+<Quiz
+  lessonId="cobol/fundamentals/02-divisions"
+  questions={[
+    {
+      prompt: "Where does FILE-CONTROL live?",
+      options: [
+        { id: "a", label: "IDENTIFICATION DIVISION" },
+        { id: "b", label: "ENVIRONMENT DIVISION (INPUT-OUTPUT SECTION)", correct: true, explanation: "FILE-CONTROL pairs file names with external dataset names." },
+        { id: "c", label: "DATA DIVISION" },
+        { id: "d", label: "PROCEDURE DIVISION" },
+      ],
+    },
+    {
+      prompt: "Where do you declare a 01-level group item?",
+      options: [
+        { id: "a", label: "IDENTIFICATION DIVISION" },
+        { id: "b", label: "ENVIRONMENT DIVISION" },
+        { id: "c", label: "DATA DIVISION", correct: true, explanation: "Group items live in WORKING-STORAGE, LINKAGE, or FILE SECTION." },
+        { id: "d", label: "PROCEDURE DIVISION" },
+      ],
+    },
+    {
+      prompt: "Which two statements live in the PROCEDURE DIVISION?",
+      multi: true,
+      options: [
+        { id: "a", label: "PERFORM", correct: true, explanation: "PERFORM is a procedural verb." },
+        { id: "b", label: "PIC", explanation: "PIC is a clause on a DATA item." },
+        { id: "c", label: "STOP RUN", correct: true, explanation: "STOP RUN ends execution." },
+        { id: "d", label: "PROGRAM-ID", explanation: "PROGRAM-ID is in IDENTIFICATION." },
+      ],
+    },
+  ]}
+/>

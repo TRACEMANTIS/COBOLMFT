@@ -1,0 +1,75 @@
+---
+module: fundamentals
+order: 3
+title: JES2 spool
+summary: How submitted jobs flow through input → conversion → execution → output queues.
+estimatedMinutes: 12
+prerequisites: [jcl-anatomy]
+objectives:
+  - Trace a job through the JES2 queues.
+  - Know what an initiator is and why classes matter.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: In what order does a job pass through JES2 queues?
+      options:
+        - { id: a, label: "input → conversion → execution → output → purge", correct: true }
+        - { id: b, label: "conversion → input → execution → purge → output" }
+        - { id: c, label: "input → execution → conversion → output → purge" }
+    - prompt: What does an initiator do?
+      options:
+        - { id: a, label: "Pulls a queued job and starts running its first EXEC step", correct: true, explanation: "Initiators are the schedulers that move work off the JES2 input queue into address spaces." }
+        - { id: b, label: "Edits JCL before submission" }
+        - { id: c, label: "Routes printer output" }
+---
+
+# JES2 spool
+
+JES2 (the Job Entry Subsystem) is the post office of the mainframe. A
+submitted job doesn't start running immediately — it joins a queue,
+gets converted, gets dispatched, and its output joins another queue.
+
+```
+SUBMIT
+   │
+   ▼
+┌─────────┐    ┌──────────────┐    ┌────────────┐    ┌────────┐    ┌───────┐
+│  INPUT  │ -> │ CONVERSION   │ -> │  EXECUTION │ -> │ OUTPUT │ -> │ PURGE │
+└─────────┘    └──────────────┘    └────────────┘    └────────┘    └───────┘
+  raw JCL        translated to       initiator picks    SYSOUT       freed
+                 internal text       up, runs steps     spooled
+```
+
+- **INPUT** — raw JCL text waiting.
+- **CONVERSION** — JES turns it into internal text plus a job log.
+- **EXECUTION** — an *initiator* (one of N pre-started address
+  spaces) dequeues a job whose CLASS it serves and runs the steps.
+- **OUTPUT** — SYSOUT and printer-bound data sit in the output queue.
+- **PURGE** — once everything's claimed, the job is purged.
+
+Job classes (set by `CLASS=` on the JOB card) and initiator classes
+together control *who* gets to run *what*. A nightly batch job in
+CLASS A and an interactive sysprog in CLASS T can share the system
+without stepping on each other.
+
+<Quiz
+  lessonId="mainframe/fundamentals/03-jes2-spool"
+  questions={[
+    {
+      prompt: "In what order does a job pass through JES2 queues?",
+      options: [
+        { id: "a", label: "input → conversion → execution → output → purge", correct: true },
+        { id: "b", label: "conversion → input → execution → purge → output" },
+        { id: "c", label: "input → execution → conversion → output → purge" },
+      ],
+    },
+    {
+      prompt: "What does an initiator do?",
+      options: [
+        { id: "a", label: "Pulls a queued job and starts running its first EXEC step", correct: true, explanation: "Initiators schedule queued work into address spaces." },
+        { id: "b", label: "Edits JCL before submission" },
+        { id: "c", label: "Routes printer output" },
+      ],
+    },
+  ]}
+/>

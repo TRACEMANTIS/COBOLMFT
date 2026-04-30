@@ -1,0 +1,68 @@
+---
+module: fundamentals
+order: 2
+title: Cut-through vs store-and-forward
+summary: Why a cut-through switch beats a store-and-forward switch on small frames at low rates.
+estimatedMinutes: 10
+prerequisites: [latency-budget]
+objectives:
+  - Compute serialization delay for a frame on a given link.
+  - Pick the right mode for a given workload.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: A 1500-byte frame on a 10 GbE link adds how much serialization delay?
+      options:
+        - { id: a, label: ~120 ns }
+        - { id: b, label: "~1.2 µs", correct: true, explanation: "1500 × 8 / 10e9 = 1.2 µs." }
+        - { id: c, label: ~12 µs }
+    - prompt: When does cut-through win clearly?
+      options:
+        - { id: a, label: "Heavy congestion with queueing" }
+        - { id: b, label: "Low utilisation, large frames", correct: true, explanation: "Cut-through saves the serialization-of-the-whole-frame component, which dominates large frames at low rates." }
+        - { id: c, label: "When you need CRC drops at the switch" }
+---
+
+# Cut-through vs store-and-forward
+
+A **store-and-forward** switch reads the entire frame into a buffer,
+checks the CRC, then forwards it. Latency through the switch is at
+least the **serialization delay** for the whole frame (`bits ÷ link
+rate`) plus the switch's own constant overhead.
+
+A **cut-through** switch starts forwarding once it has read enough of
+the header to know the destination port — typically after 64 bytes.
+Latency through the switch becomes a near-constant (a few hundred
+nanoseconds for current silicon) regardless of frame size.
+
+The trade-off:
+
+- Cut-through cannot drop a corrupted frame at the switch (it has
+  already started forwarding). Errors propagate to the receiving NIC
+  to deal with.
+- Store-and-forward shines under congestion when buffering helps; on a
+  quiet link with large frames the serialization tax dominates.
+
+<SwitchSim />
+
+<Quiz
+  lessonId="networks/fundamentals/02-cut-through"
+  questions={[
+    {
+      prompt: "A 1500-byte frame on a 10 GbE link adds how much serialization delay?",
+      options: [
+        { id: "a", label: "~120 ns" },
+        { id: "b", label: "~1.2 µs", correct: true, explanation: "1500 × 8 / 10e9 = 1.2 µs." },
+        { id: "c", label: "~12 µs" },
+      ],
+    },
+    {
+      prompt: "When does cut-through win clearly?",
+      options: [
+        { id: "a", label: "Heavy congestion with queueing" },
+        { id: "b", label: "Low utilisation, large frames", correct: true, explanation: "The serialization saving dominates." },
+        { id: "c", label: "When you need CRC drops at the switch" },
+      ],
+    },
+  ]}
+/>

@@ -1,0 +1,107 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: #0a0e14;
+  color: #d6d3cb;
+  min-height: 100vh;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+pre,
+code,
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.prose-cobol {
+  max-width: 72ch;
+  line-height: 1.65;
+}
+
+.prose-cobol h1 {
+  font-size: 1.875rem;
+  font-weight: 700;
+  margin-top: 0;
+  margin-bottom: 1rem;
+  color: #fff;
+}
+
+.prose-cobol h2 {
+  font-size: 1.4rem;
+  font-weight: 600;
+  margin-top: 2rem;
+  margin-bottom: 0.75rem;
+  color: #fff;
+  border-bottom: 1px solid #1f2933;
+  padding-bottom: 0.25rem;
+}
+
+.prose-cobol h3 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-top: 1.5rem;
+  margin-bottom: 0.5rem;
+  color: #e6e3da;
+}
+
+.prose-cobol p {
+  margin-bottom: 1rem;
+}
+
+.prose-cobol ul,
+.prose-cobol ol {
+  margin-left: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.prose-cobol ul {
+  list-style: disc;
+}
+
+.prose-cobol ol {
+  list-style: decimal;
+}
+
+.prose-cobol code {
+  background: #1f2933;
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.25rem;
+  font-size: 0.9em;
+}
+
+.prose-cobol pre {
+  background: #11161d;
+  border: 1px solid #1f2933;
+  border-radius: 0.5rem;
+  padding: 1rem;
+  overflow-x: auto;
+  margin-bottom: 1rem;
+}
+
+.prose-cobol pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.prose-cobol a {
+  color: #59c2ff;
+  text-decoration: underline;
+}
+
+.prose-cobol blockquote {
+  border-left: 3px solid #59c2ff;
+  padding-left: 1rem;
+  color: #a8a59b;
+  margin: 1rem 0;
+}

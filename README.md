@@ -129,9 +129,55 @@ of progressive modules, each module ends with a graded lab.
 
 ## Status
 
-Project scaffolding only. Architecture, curriculum design, and tech
-stack are still to be planned - that is what the next round of
-planning will produce.
+This branch lands the v1 platform scaffold: a Next.js + TypeScript
+monorepo, lesson schema + MDX content loader, sandboxed COBOL
+execution (server runner; WASM behind a feature flag), tenancy with
+admin UI, NextAuth credentials sign-in, and a one-shot AWS deploy
+script.
+
+## Running locally
+
+Prereqs: Node 22, pnpm 9, Docker.
+
+```bash
+cp .env.example .env.local
+docker compose up -d postgres
+docker build -t cobol-mf/cobol-runtime:latest -f services/runner/Dockerfile.cobol services/runner
+pnpm install
+pnpm prisma migrate dev
+BOOTSTRAP_ADMIN_EMAIL=admin@example.com \
+BOOTSTRAP_ADMIN_PASSWORD=changeme-please \
+  pnpm prisma:seed
+pnpm dev
+```
+
+Visit `http://localhost:3000`. Sign in with the admin credentials you
+seeded.
+
+## Deploying to AWS
+
+```bash
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+  ./scripts/deploy.sh --region us-east-1 --git-repo https://github.com/you/cobol-mf.git
+```
+
+The script provisions an EC2 host, installs Docker + nginx, brings up
+the app, and prints the public URL plus the OWNER credentials.
+
+## Layout
+
+| Path                              | What                                           |
+| --------------------------------- | ---------------------------------------------- |
+| `app/`                            | Next.js App Router pages + API routes          |
+| `content/<pillar>/<lesson>/`      | MDX lessons with typed frontmatter             |
+| `packages/lesson-schema/`         | Zod schemas, single source of truth            |
+| `packages/sandbox-client/`        | Picks WASM or server, called from CodeLab      |
+| `packages/sandbox-wasm/`          | GnuCOBOL → WASM stub (drop-in slot)            |
+| `packages/ui/`                    | CodeLab, Quiz, JCLLab, LatencyBudget, SwitchSim |
+| `services/runner/`                | Hono service that shells `docker run`          |
+| `prisma/`                         | Schema + first-boot seed                       |
+| `infra/terraform/`                | AWS deploy module                              |
+| `scripts/deploy.sh`               | One-shot wrapper                               |
 
 ---
 
