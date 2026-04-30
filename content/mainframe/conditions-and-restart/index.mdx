@@ -1,0 +1,509 @@
+---
+module: jcl
+order: 3
+title: Conditions and restart
+summary: COND parameters, IF/THEN/ELSE/ENDIF, return codes, and the discipline of designing a multi-step job so it can be restarted cleanly. The skill that turns "rerun the whole job" into "kick off from STEP030."
+estimatedMinutes: 30
+prerequisites: [what-is-zos, jcl-anatomy, dd-statements-deep, procedures]
+objectives:
+  - Read COND parameters and predict whether a step will execute, skip, or terminate the job.
+  - Translate between COND syntax and the modern IF/THEN/ELSE/ENDIF form.
+  - Identify the conditions under which a job is safely restartable.
+  - Design a multi-step job so individual steps can be re-run on retry without losing or duplicating work.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: "//STEP3 EXEC PGM=ABC,COND=(4,LT,STEP1) — when does STEP3 execute?"
+      options:
+        - { id: a, label: "Only when STEP1's return code is LESS THAN 4 — i.e., 0, 1, 2, or 3.", correct: true, explanation: "COND tests are logically: 'skip this step if the test is TRUE.' COND=(4,LT,STEP1) means 'if 4 LT (STEP1 return code), skip.' Skip if STEP1 RC > 4. Run if STEP1 RC <= 4. The reading is counter-intuitive on first encounter and is one of the most-confused JCL syntaxes." }
+        - { id: b, label: "Whenever STEP1 has run, regardless of RC." }
+        - { id: c, label: "Only when STEP1's return code equals 4." }
+        - { id: d, label: "Only when STEP1 ABENDed." }
+    - prompt: "IF (RC = 0) THEN ... ENDIF — how does this compare to COND syntax?"
+      options:
+        - { id: a, label: "Modern, more readable equivalent of COND. Cleanest way to express conditional step execution; COND remains available for legacy compatibility.", correct: true, explanation: "IF/THEN/ELSE/ENDIF is the post-1990 JCL conditional syntax. RC tests are identical in meaning but read forward — if RC is X, then run X. Most new JCL uses this; legacy code is split between the two." }
+        - { id: b, label: "Slower at runtime." }
+        - { id: c, label: "Only available in instream PROCs." }
+        - { id: d, label: "Runs both branches and picks one at end." }
+    - prompt: "RESTART=STEP030 on the JOB card — what does it do?"
+      options:
+        - { id: a, label: "The job starts at STEP030, skipping every step before it. Used to resume a partial run after fixing the cause of a previous failure.", correct: true, explanation: "Saves rerun time by skipping completed steps. Requires that the steps' outputs (datasets, GDG generations) are still in a consistent state; that's the 'designed for restart' precondition." }
+        - { id: b, label: "Restarts the JES2 subsystem." }
+        - { id: c, label: "Forces all steps to run regardless of COND." }
+        - { id: d, label: "Restarts the job from the previous failure point automatically." }
+    - prompt: "A 5-step job created GDG generations PROD.GDG(+1), PROD.GDG(+2), PROD.GDG(+3) in steps 1, 2, 3 respectively. The job ABENDed in step 4. The operator restarts at STEP=4. What's the GDG state?"
+      options:
+        - { id: a, label: "Generations 1, 2, 3 are committed; +4 in step 4 is going to fail with a duplicate-key or sequence error because the +1 / +2 / +3 already exist on disk.", correct: true, explanation: "GDG (+N) refers to relative generations. After steps 1-3 committed (DISP=CATLG), those generations are real. A restart at step 4 trying to create (+4) collides. The fix is either: design steps 1-3 to be idempotent (re-runnable); or ensure restart drops the GDGs first; or use absolute generation names. This is one of the most common restart hazards." }
+        - { id: b, label: "GDGs are unaffected; restart just re-runs step 4 cleanly." }
+        - { id: c, label: "GDGs auto-renumber to +1, +2, +3 on restart." }
+        - { id: d, label: "z/OS automatically rolls back step 1-3 outputs." }
+    - prompt: Which two patterns make a multi-step job genuinely restartable?
+      multi: true
+      options:
+        - { id: a, label: "Each step's output dataset is created fresh in that step (DISP=NEW with DELETE on abend), so re-running the step from scratch produces the correct output.", correct: true, explanation: "Idempotent step semantics. The step can be re-run any number of times and produces the same result." }
+        - { id: b, label: "Steps that produce side effects (DB2 writes, MQ posts, external API calls) check whether the side effect already happened before re-doing it.", correct: true, explanation: "Idempotency for side effects. Common pattern: a unique transaction ID stored in a control table, checked at start of step; if found, skip the side effect." }
+        - { id: c, label: "Every step uses DISP=MOD on its output to append safely." }
+        - { id: d, label: "All steps share one massive temporary dataset." }
+---
+
+# Conditions and restart
+
+A real production batch job has steps that depend on each other. Step
+1 reads a master file, step 2 produces an extract, step 3 sorts the
+extract, step 4 loads the result. If step 2 fails, you do not want
+step 3 to run on garbage. If step 4 fails after step 3 succeeded, you
+want to restart from step 4 without re-running everything.
+
+This lesson is about the JCL primitives for conditional execution
+(`COND`, `IF/THEN/ELSE/ENDIF`) and the design discipline that makes a
+job restartable. By the end you should be able to read a multi-step
+job, identify its restart points, and choose where to kick off a
+recovery run.
+
+## Return codes
+
+Every step ends with a **return code** — a number set by the program
+or, on ABEND, by the system:
+
+| RC range  | Convention                                                |
+| --------- | --------------------------------------------------------- |
+| `0`       | Clean success                                              |
+| `4`       | Warning — process completed but with notable issues       |
+| `8`       | Errors — partial completion                                |
+| `12`      | Severe errors                                              |
+| `16+`     | Fatal — the program decided to terminate                   |
+| `4095`    | (rare) maximum RC value                                    |
+
+For COBOL programs, the return code is the contents of the special
+register `RETURN-CODE` at end-of-program:
+
+```cobol
+*  Set RC explicitly before STOP RUN
+MOVE 8 TO RETURN-CODE.
+STOP RUN.
+```
+
+Default is 0. ABENDs do not set a return code; the system code (e.g.,
+`S0C7`) is reported separately, and downstream COND/IF tests treat
+ABENDed steps differently from RC-failures.
+
+The shop-wide convention is the load-bearing piece: if a payroll
+extract returns 4 to mean "no records found, but proceed" and the
+downstream report uses `COND=(4,LT)` (run if RC <= 4), the program
+flows. Different shops have different conventions; what's "warning"
+in one is "error" in another.
+
+## COND — the legacy conditional syntax
+
+`COND` on an EXEC card tests prior steps' return codes:
+
+```jcl
+//STEP3   EXEC PGM=ABC,COND=(4,LT,STEP1)
+```
+
+Read this as: **skip STEP3 if `4 LT STEP1`'s RC**. Skip if step 1's
+RC is greater than 4. Run if step 1's RC is 4 or less.
+
+The full COND syntax is:
+
+```
+COND=(value,operator[,stepname])
+```
+
+- **value** — constant on the left side of the comparison.
+- **operator** — `EQ`, `NE`, `LT`, `LE`, `GT`, `GE`.
+- **stepname** — optional; if omitted, applies to all preceding steps.
+
+The mental model people start with — "this is the condition under which
+the step runs" — is **wrong**. The COND test is the condition under
+which the step is **skipped**. This inverted logic is a permanent
+JCL stumbling block; if you find it confusing, you are not alone.
+
+### Multiple conditions
+
+```jcl
+//STEP3   EXEC PGM=ABC,COND=((4,LT,STEP1),(0,NE,STEP2))
+```
+
+Multiple `(value,op,stepname)` tuples. **STEP3 is skipped if ANY of
+the tests are TRUE** (logical OR of skip conditions).
+
+### COND on the JOB card
+
+```jcl
+//MYJOB JOB CLASS=A,COND=(8,LT)
+```
+
+Job-level COND tests every step. If `8 LT (any step's RC)`, the
+remaining steps are skipped. Used to terminate the job early on
+serious errors.
+
+### COND=ONLY and COND=EVEN
+
+```jcl
+//STEP9   EXEC PGM=CLEANUP,COND=ONLY
+```
+
+`COND=ONLY` means "run this step ONLY if a previous step ABENDed."
+Used for cleanup or notification steps that should run **only** on
+failure.
+
+```jcl
+//STEP9   EXEC PGM=CLEANUP,COND=EVEN
+```
+
+`COND=EVEN` means "run this step EVEN if a previous step ABENDed."
+Used for cleanup steps that must always run.
+
+## IF/THEN/ELSE/ENDIF — the modern syntax
+
+JCL gained `IF/THEN/ELSE/ENDIF` in the late 1980s and most modern
+shops use it for new code:
+
+```jcl
+//STEP1   EXEC PGM=EXTRACT
+//STEP2   EXEC PGM=SORT
+//*
+//IF (STEP1.RC = 0 AND STEP2.RC = 0) THEN
+//STEP3   EXEC PGM=LOAD
+//ENDIF
+//*
+//IF (STEP1.RC > 0 OR STEP2.RC > 0) THEN
+//ALERT   EXEC PGM=PAGE,COND=EVEN
+//ENDIF
+//*
+//IF (ABEND) THEN
+//CLEAN   EXEC PGM=CLEANUP
+//ENDIF
+```
+
+What this gets right:
+
+- Reads forward — `IF (cond) THEN run X` instead of `if (skip-cond)
+  skip X`.
+- Composable boolean logic with `AND`, `OR`, parentheses.
+- `ABEND` and `NOT ABEND` test for any prior abnormal termination.
+
+A real shop's JCL is a mix: legacy steps use COND; recent code uses
+IF/THEN/ELSE/ENDIF. As a maintainer you must read both fluently.
+
+### Symbolic step references
+
+```jcl
+IF (STEP1.RC > 0) THEN ...
+IF (STEP1.STEP2.RC > 0) THEN ...     *> step inside an EXEC PROC
+IF (PAYROLL.PAYBL010.RC > 0) THEN ... *> if PAYROLL is a PROC name
+```
+
+Inside a PROC, the step names you reference are the PROC's internal
+step names. Outside (in the invoking JCL), you may need to qualify
+with the EXEC step name that invoked the PROC.
+
+## RESTART — kicking off mid-job
+
+When a multi-step job fails partway, you can restart it from any step
+without re-running the prior ones:
+
+```jcl
+//MYJOB JOB CLASS=A,RESTART=STEP030
+```
+
+Or for a step inside a PROC:
+
+```jcl
+//MYJOB JOB CLASS=A,RESTART=PAYROLL.PAYBL020
+```
+
+The job runs as if every step before `STEP030` (or `PAYROLL.PAYBL020`)
+had completed with RC=0. COND and IF tests against those skipped
+steps see "RC=0," not "did not run."
+
+This works **only if the prior steps' outputs are still in the right
+state**. If the failed step needs the previous step's output dataset,
+that dataset must still exist and be correct. Designing for this
+condition is the point of the rest of the lesson.
+
+## GDG considerations on restart
+
+GDGs are the most common restart hazard. Recall:
+
+- `DSN=PROD.MYGDG(+1)` references the next (new) generation.
+- A successful step with `DISP=(NEW,CATLG,DELETE)` on `(+1)`
+  **commits** that generation — it becomes the new (0).
+- Subsequent steps in the same job that reference `(+1)` continue to
+  see "the next generation" as the same generation just created.
+- After job end, the GDG numbering stabilises; what was `(+1)` is now
+  `(0)`.
+
+The hazard:
+
+```jcl
+//STEP01  EXEC PGM=ABC
+//OUT     DD   DSN=PROD.MYGDG(+1),DISP=(NEW,CATLG,DELETE)
+//*
+//STEP02  EXEC PGM=DEF
+//OUT     DD   DSN=PROD.MYGDG(+2),DISP=(NEW,CATLG,DELETE)
+//*
+//STEP03  EXEC PGM=GHI    ← ABENDs here
+//OUT     DD   DSN=PROD.MYGDG(+3),DISP=(NEW,CATLG,DELETE)
+```
+
+After the ABEND in STEP03:
+
+- `(+1)` (now `(0)`) is committed — STEP01 succeeded.
+- `(+2)` (now `(-1)` from the just-finished position? No — actually
+  `(+2)` becomes `(0)` from STEP02's perspective; for the still-active
+  job, the relative numbers persist; once the job is over, the
+  catalogue commits the new generations).
+
+Actually: GDG numbering is **stabilised at job end**, not at each
+step. So during the job, `(+1)`, `(+2)`, `(+3)` are placeholders. At
+job end, they become real catalogued generations.
+
+But here's the catch: when an ABEND happens mid-job, **the
+already-committed steps' DISP=(NEW,CATLG,DELETE) on `(+N)` typically
+defaults to KEEP-on-abend** unless explicitly DELETE. Modern shops
+configure this carefully; older configurations leave generations
+in inconsistent states.
+
+If you `RESTART=STEP03` after fixing the bug, STEP03's
+`DSN=PROD.MYGDG(+3)` references "the third new one" — but is that
+the third counting from before the original run, or counting from
+now? The answer depends on whether the previous run's generations
+were left in the catalog or not, and **this is one of the most
+common sources of mysterious "duplicate dataset" errors on restart**.
+
+The defensive fix:
+
+- At restart prep, run an `IDCAMS DELETE` step to clean up any
+  partially-committed GDG generations from the failed run.
+- Or design steps so they tolerate "the dataset already exists" —
+  delete-and-recreate inside the step.
+- Or use absolute generation names (`PROD.MYGDG.G0042V00`) instead of
+  relative `(+N)`, so the names are unambiguous regardless of
+  catalog state.
+
+## Designing restartable jobs
+
+Three design rules turn an arbitrary multi-step job into a
+restartable one:
+
+### 1. Each step's output is created fresh
+
+```jcl
+//STEP02  EXEC PGM=ABC
+//OUTFILE DD   DSN=PROD.STEP02.OUTPUT,
+//             DISP=(NEW,CATLG,DELETE),
+//             ...
+```
+
+`(NEW,CATLG,DELETE)` means: new at start, catalog on success, delete
+on ABEND. Re-running this step from scratch always starts with a
+fresh dataset. The previous dataset (if any) needs to be cleaned up
+first — typically by an `IDCAMS DELETE` before the EXEC, or by
+configuring the dataset's DCB to allow `DISP=(MOD,...)` semantics.
+
+### 2. Side effects are idempotent
+
+If a step writes to a database, a queue, or an external system,
+re-running it must not duplicate or corrupt:
+
+- Use a **transaction ID** — store one in a control table at start
+  of step, check it on re-entry, skip the side effect if already
+  recorded.
+- Use **upsert** semantics — `MERGE` or `INSERT...ON DUPLICATE KEY
+  UPDATE` instead of `INSERT`.
+- Wrap multi-row writes in **commit boundaries** that align with
+  re-runnable units.
+
+### 3. Steps fail clearly
+
+If a step partially-succeeds (some records written, some not), the
+step must either:
+
+- Roll back to a clean state on failure, OR
+- Record exactly which records were processed so a restart can resume
+  from the right point.
+
+Programs that say "wrote 47 records, then failed at row 48" without
+specifying which 47 are unrestartable in any safe way.
+
+## A worked job
+
+```jcl
+//PAYROLL JOB CLASS=A,MSGCLASS=X
+//*
+//STEP010 EXEC PGM=PAYBL010
+//CUSTMSTR DD  DSN=PROD.CUST.MASTER,DISP=SHR
+//OUTFILE DD   DSN=PROD.PAYROLL.EXTRACT(+1),
+//             DISP=(NEW,CATLG,DELETE),
+//             SPACE=(CYL,(50,10),RLSE),
+//             RECFM=FB,LRECL=120,BLKSIZE=0
+//*
+//STEP020 EXEC PGM=SORT,COND=(0,LT,STEP010)
+//SORTIN  DD   DSN=*.STEP010.OUTFILE,DISP=OLD
+//SORTOUT DD   DSN=PROD.PAYROLL.SORTED(+1),
+//             DISP=(NEW,CATLG,DELETE),
+//             SPACE=(CYL,(50,10),RLSE),
+//             RECFM=FB,LRECL=120,BLKSIZE=0
+//SYSIN   DD   *
+  SORT FIELDS=(1,8,CH,A)
+/*
+//*
+//STEP030 EXEC PGM=PAYBL020,COND=(0,LT,STEP020)
+//PAYIN   DD   DSN=*.STEP020.SORTOUT,DISP=OLD
+//PAYOUT  DD   DSN=PROD.PAYROLL.PAYMENTS(+1),
+//             DISP=(NEW,CATLG,DELETE),
+//             SPACE=(CYL,(50,10),RLSE),
+//             RECFM=FB,LRECL=120,BLKSIZE=0
+//*
+//IF (STEP030.RC > 0 OR ABEND) THEN
+//ALERT   EXEC PGM=PAGEOPS
+//ENDIF
+```
+
+Reading this:
+
+- 3 main steps + 1 conditional alert.
+- Each main step uses `(NEW,CATLG,DELETE)` and creates a fresh GDG
+  generation. Re-running with `RESTART=STEP030` requires the
+  intermediate datasets to exist and be valid (they were created in
+  steps 010 and 020 of the original run).
+- COND on STEP020 and STEP030 mean: "skip if any prior step had RC > 0."
+  So failure cascades cleanly.
+- The IF block runs the operations alert if STEP030 failed or ABENDed.
+- The job is restartable from STEP030 if STEP020's output is still
+  valid; from STEP020 if STEP010's is.
+
+The restart procedure for a STEP030 failure:
+
+1. Diagnose and fix the cause (typically a code or data issue).
+2. If the GDG generations from STEP010 and STEP020 are valid, the
+   restart is just `RESTART=STEP030`.
+3. If they are corrupt or partial, you may need to IDCAMS DELETE the
+   bad generations first, then restart from STEP010 or STEP020.
+
+The maintainer's instinct: when triaging a failed batch, **look at
+the GDG state** before deciding where to restart. A clean GDG state
+is the precondition for an easy restart.
+
+## Lab: read a job
+
+Below is a job specification (in a comment block — there's no runnable
+COBOL component for restart logic). Predict the order in which steps
+execute given the return codes shown.
+
+<CodeLab
+  lessonId="cobol/jcl/conditions-and-restart"
+  runtime="server"
+  starter={`*  Imagine this job runs and the program-driven RCs are:
+*    STEP010 returns 0
+*    STEP020 returns 4
+*    STEP030 returns 0
+*    STEP040 ABENDs with S0C7
+*
+*  The JCL is:
+*
+*    //STEP010 EXEC PGM=A
+*    //STEP020 EXEC PGM=B,COND=(0,LT,STEP010)
+*    //STEP030 EXEC PGM=C,COND=(4,LT,STEP020)
+*    //STEP040 EXEC PGM=D,COND=(0,LT,STEP030)
+*    //IF (ABEND) THEN
+*    //CLEANUP EXEC PGM=CLEANUP
+*    //ENDIF
+*
+*  Question: which steps execute?
+*
+*  Walk through:
+*    STEP010 — runs (no COND). RC = 0.
+*    STEP020 — COND=(0,LT,STEP010): "skip if 0 LT STEP010 RC".
+*              0 LT 0? FALSE. Test is FALSE. Run STEP020. RC = 4.
+*    STEP030 — COND=(4,LT,STEP020): "skip if 4 LT STEP020 RC".
+*              4 LT 4? FALSE. Run STEP030. RC = 0.
+*    STEP040 — COND=(0,LT,STEP030): "skip if 0 LT STEP030 RC".
+*              0 LT 0? FALSE. Run STEP040. ABENDs with S0C7.
+*    IF (ABEND) THEN — TRUE. CLEANUP runs.
+*
+*  Result: STEP010, STEP020, STEP030, STEP040, CLEANUP all execute.
+*
+*  Common confusion: people read COND=(4,LT,STEP020) as "run if
+*  STEP020 RC < 4" but the actual semantics is "skip if 4 < STEP020
+*  RC" — i.e., "run if STEP020 RC <= 4". Same outcome here since
+*  RC=4, but the inverted reading is the canonical JCL gotcha.
+
+IDENTIFICATION DIVISION.
+PROGRAM-ID. COND-WALK.
+PROCEDURE DIVISION.
+    DISPLAY "see comments above for COND walkthrough".
+    STOP RUN.`}
+  hints={[
+    "COND tests are 'skip if true,' not 'run if true.' Always negate in your head.",
+    "ABEND is a separate condition from RC > 0.",
+    "Practical check: if you find COND confusing, prefer IF/THEN/ELSE/ENDIF in any new code you write."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/jcl/conditions-and-restart"
+  questions={[
+    {
+      prompt: "//STEP3 EXEC PGM=ABC,COND=(4,LT,STEP1) — when does STEP3 run?",
+      options: [
+        { id: "a", label: "Only when STEP1's RC is 0, 1, 2, 3, or 4.", correct: true, explanation: "Skip if 4 LT STEP1 RC. Run if STEP1 RC <= 4." },
+        { id: "b", label: "Whenever STEP1 ran." },
+        { id: "c", label: "Only when STEP1 RC = 4." },
+        { id: "d", label: "Only when STEP1 ABENDed." },
+      ],
+    },
+    {
+      prompt: "IF (RC = 0) THEN ... ENDIF vs COND?",
+      options: [
+        { id: "a", label: "Modern, more readable equivalent.", correct: true, explanation: "Forward-reading conditional." },
+        { id: "b", label: "Slower at runtime." },
+        { id: "c", label: "Only in instream PROCs." },
+        { id: "d", label: "Runs both branches." },
+      ],
+    },
+    {
+      prompt: "RESTART=STEP030 on JOB card?",
+      options: [
+        { id: "a", label: "Job starts at STEP030, skipping prior steps.", correct: true, explanation: "Used to resume after fixing failure." },
+        { id: "b", label: "Restarts JES2." },
+        { id: "c", label: "Forces all steps to run regardless of COND." },
+        { id: "d", label: "Auto-resumes from previous failure." },
+      ],
+    },
+    {
+      prompt: "Job ABENDed in step 4 after creating GDG (+1)/(+2)/(+3) in steps 1-3. Restart at STEP=4?",
+      options: [
+        { id: "a", label: "Generations 1-3 committed; (+4) collides with disposition or sequence.", correct: true, explanation: "GDG state is the most common restart hazard." },
+        { id: "b", label: "GDGs unaffected." },
+        { id: "c", label: "GDGs auto-renumber." },
+        { id: "d", label: "z/OS rolls back." },
+      ],
+    },
+    {
+      prompt: "Which two patterns make a job restartable?",
+      multi: true,
+      options: [
+        { id: "a", label: "Output datasets created fresh per step (NEW with DELETE on abend).", correct: true, explanation: "Idempotent step semantics." },
+        { id: "b", label: "Side effects checked for prior completion before re-doing.", correct: true, explanation: "Idempotent side effects." },
+        { id: "c", label: "All steps use DISP=MOD on output." },
+        { id: "d", label: "All steps share one big temp dataset." },
+      ],
+    },
+  ]}
+/>
+
+## End of module
+
+This is the final lesson in the **JCL** module. Together with
+`jcl-anatomy` and `jes2-spool` (in the fundamentals module),
+`dd-statements-deep`, `procedures`, and this lesson, you have the
+JCL working knowledge a maintainer needs: read a job, predict its
+behavior, diagnose a failure, restart it cleanly. Combined with the
+COBOL `data-layout` and `abends` modules, this completes Phase 1 of
+the curriculum — the highest-leverage 13 lessons for COBOL/mainframe
+maintenance work.
