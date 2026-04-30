@@ -1,0 +1,368 @@
+---
+module: data-layout
+order: 1
+title: PIC clauses and packed decimal
+summary: Reading the byte layout of every COBOL field — PIC X, zoned numeric, signed overpunch, and the COMP-3 format that runs every batch finance system.
+estimatedMinutes: 30
+prerequisites: [hello-world, divisions]
+objectives:
+  - Predict the byte size of any PIC clause, including signed and COMP-3.
+  - Read a copybook and total its record length without a calculator.
+  - Recognise the byte patterns that produce S0C7 ABENDs in production.
+  - Pick the right MOVE between PIC X, zoned numeric, and packed decimal.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: How many bytes does PIC S9(11)V99 COMP-3 occupy?
+      options:
+        - { id: a, label: "7", correct: true, explanation: "ceil((11 + 2 + 1) / 2) = ceil(14 / 2) = 7. Don't forget the sign nibble — it's the +1." }
+        - { id: b, label: "13" }
+        - { id: c, label: "14" }
+        - { id: d, label: "8" }
+    - prompt: An uninitialized COMP-3 field is X'00 00 00'. What happens when ADD 1 hits it?
+      options:
+        - { id: a, label: "It's treated as zero and the result is X'00 00 1C'." }
+        - { id: b, label: "S0C7 data exception.", correct: true, explanation: "The last nibble (X'0') is not a valid sign. C, D, and F are the only legal sign nibbles. The packed-decimal hardware instruction faults." }
+        - { id: c, label: "Compiler error." }
+        - { id: d, label: "Result is X'00 00 01' with sign +." }
+    - prompt: "MOVE 'BANANA' TO a PIC 9(6) field, then ADD 1 to that field. What happens?"
+      options:
+        - { id: a, label: "Compile error." }
+        - { id: b, label: "Result is 1, alpha is treated as zero." }
+        - { id: c, label: "S0C7 at runtime.", correct: true, explanation: "The MOVE is legal — character copy into zoned decimal. But the bytes (X'C2 C1 D5 C1 D5 C1' in EBCDIC) are not valid zoned digits. The next arithmetic faults." }
+        - { id: d, label: "Result is the string BANANB." }
+    - prompt: Which two statements about MOVE are true?
+      multi: true
+      options:
+        - { id: a, label: "Numeric MOVE aligns on the implied decimal point.", correct: true, explanation: "Numeric MOVE aligns on V (or right-justifies if there is no V). Padding is on the unused side." }
+        - { id: b, label: "Alphanumeric MOVE is right-justified." }
+        - { id: c, label: "Alphanumeric MOVE pads on the right with spaces.", correct: true, explanation: "PIC X is left-aligned and pads with X'40' (EBCDIC space) on the right." }
+        - { id: d, label: "MOVE always validates that bytes match the target PIC." }
+    - prompt: "In zoned decimal, the value -25 in PIC S9(2) is which two bytes (EBCDIC)?"
+      options:
+        - { id: a, label: "X'F2 D5'", correct: true, explanation: "Last byte's zone nibble carries the sign. D = negative. So digit 2 is X'F2', digit 5 with negative sign is X'D5'." }
+        - { id: b, label: "X'F2 F5'" }
+        - { id: c, label: "X'D2 F5'" }
+        - { id: d, label: "X'2D 5F'" }
+---
+
+# PIC clauses and packed decimal
+
+A COBOL maintainer spends more time reading data declarations than
+writing logic. Every record pulled from a VSAM file, every copybook
+included by a payroll program, every parameter passed across a `CALL`
+boundary — they are all PIC clauses describing exact byte layouts. Get
+the layout wrong and the program either ABENDs or, worse, runs and
+quietly produces incorrect output.
+
+This lesson covers the three PIC families you will see daily:
+alphanumeric (`PIC X`), zoned numeric (`PIC 9`), and packed decimal
+(`USAGE COMP-3`). By the end you should be able to look at a copybook,
+predict the byte layout in memory, and recognise the patterns that
+produce S0C7 ABENDs in production.
+
+## PIC X — alphanumeric
+
+`PIC X(n)` declares an `n`-byte field of arbitrary characters, one byte
+per position. The bytes are EBCDIC on z/OS and ASCII under GnuCOBOL —
+the same field, two encodings, depending on where it runs.
+
+```cobol
+01  CUSTOMER-NAME   PIC X(30).
+01  STATE-CODE      PIC X(2).
+```
+
+- 30 bytes for the name. Padded right with the host's space character
+  (`X'40'` in EBCDIC, `X'20'` in ASCII).
+- 2 bytes for the state code.
+
+`PIC A` exists too — alphabetic only — but you will almost never see it
+in real code. Everyone uses `PIC X`.
+
+A `MOVE` from a longer source to a shorter `PIC X` truncates on the
+right. Shorter to longer pads with spaces on the right. There is no
+warning either way, and that is the source of an entire class of "the
+last three characters disappeared" tickets.
+
+## PIC 9 — zoned numeric (USAGE DISPLAY)
+
+`PIC 9(n)` declares an `n`-digit unsigned numeric field, but in a
+display-friendly format that costs one byte per digit. This is **zoned
+decimal**.
+
+```cobol
+01  AGE-IN-YEARS    PIC 9(3).
+01  ZIP-CODE        PIC 9(5).
+```
+
+Each digit is stored as the EBCDIC character for that digit:
+
+| Digit | EBCDIC byte | Comment |
+|-------|-------------|---------|
+| 0     | `X'F0'`     | Zone nibble `F`, digit nibble `0` |
+| 1     | `X'F1'`     | |
+| ...   | ...         | |
+| 9     | `X'F9'`     | Zone nibble `F`, digit nibble `9` |
+
+So the value `25` in `PIC 9(2)` is the bytes `F2 F5`. The high nibble
+(`F`) is the **zone**; the low nibble carries the digit. That is what
+gives "zoned decimal" its name.
+
+### Signed: PIC S9 and overpunch
+
+`PIC S9(n)` is signed. Without further annotation, the sign is encoded
+into the **last byte** of the field by replacing its zone nibble:
+
+| Sign      | Zone nibble of last byte |
+|-----------|--------------------------|
+| +         | `C`                      |
+| -         | `D`                      |
+| unsigned  | `F`                      |
+
+`+25` in `PIC S9(2)` is `F2 C5`. `-25` is `F2 D5`. This is **trailing
+sign overpunch** — a 50-year-old convention you will see in every
+fixed-width interface file ever written by a mainframe shop.
+
+A trailing `SIGN IS LEADING SEPARATE` clause overrides this and stores
+the sign as a discrete leading byte (`+` or `-`). You will see this in
+modern interface definitions and almost never in legacy.
+
+### V — the implied decimal point
+
+The implied decimal point `V` is **not stored**. It tells the compiler
+where the decimal goes for arithmetic, and that is all. Real money
+columns commonly look like:
+
+```cobol
+01  AMOUNT-DUE      PIC S9(7)V99.
+```
+
+Nine bytes on disk. Seven before the implied point, two after. The `V`
+is purely a metadata hint to the compiler so it knows how to align this
+field when you `ADD AMOUNT-DUE TO PAYMENT`.
+
+## USAGE COMP-3 — packed decimal
+
+`COMP-3` (also written `COMPUTATIONAL-3` or `PACKED-DECIMAL`) is the
+storage format every batch finance system runs on. Two decimal digits
+per byte, plus one nibble at the very end for the sign.
+
+**Size formula:** `ceil((digits + 1) / 2)` bytes. The `+1` is the sign
+nibble.
+
+So `PIC S9(7)V99 COMP-3` is 9 digits plus a sign nibble — 10 nibbles —
+5 bytes. The same money column from the zoned example, compressed from
+9 bytes to 5.
+
+<Diagram title="S9(7)V99 COMP-3 — value +1234567.89">
+
+Nine digits and a sign nibble laid out as 5 bytes, left to right:
+
+```
+byte 0   byte 1   byte 2   byte 3   byte 4
+  12       34       56       78       9C
+                                       ^
+                                       sign nibble
+```
+
+- Sign nibble values: `C` = positive, `D` = negative, `F` = unsigned.
+- Same value, negated: `12 34 56 78 9D`.
+- Same value, declared without `S` (unsigned): `12 34 56 78 9F`.
+
+</Diagram>
+
+The sign nibble values are deliberately the same encoding as zoned
+decimal's zone nibble for positive and negative — that is not a
+coincidence. The IBM Z hardware uses one set of "valid sign" rules
+across both formats.
+
+### Why COMP-3 exists
+
+- About half the storage of zoned decimal (5 bytes vs 9 for our
+  example).
+- The IBM Z hardware has decimal arithmetic instructions
+  (`AP` add packed, `SP` subtract, `MP` multiply, `DP` divide) that
+  operate on packed-decimal directly. No conversion needed for adds,
+  subtracts, and so on. This is fast on Z; nothing else on a modern CPU
+  has hardware decimal arithmetic.
+- Decimal-exact arithmetic with no binary floating-point rounding,
+  which is mandatory for money.
+
+If you are maintaining a finance system, more than half the numeric
+fields you encounter will be `COMP-3`. The other COMP variants
+(`COMP`/`COMP-4` for binary halfword/fullword, `COMP-1`/`COMP-2` for
+floating point) appear in counters, indexes, and scientific code, but
+COMP-3 dominates business data.
+
+<Callout kind="warn" title="The S0C7 ABEND">
+
+A "data exception" (S0C7) is the single most common ABEND in production
+COBOL. It happens when a decimal arithmetic instruction hits bytes that
+are not a valid packed decimal or zoned digit:
+
+- An uninitialized `COMP-3` field — often `X'00 00 00 00 00'`. There is
+  no valid sign nibble in the last byte, so `AP` faults the instant
+  arithmetic touches the field.
+- A `PIC X` field full of spaces (`X'40 40 40 40 40'` in EBCDIC) being
+  used in arithmetic via a misplaced `MOVE` or a `REDEFINES` of a text
+  field as numeric.
+- A "low-values" or binary garbage record being arithmetic'd as if it
+  were a number — typically because the upstream file had a header row
+  that the program did not skip.
+
+The remediation is almost always one of: initialise the field properly
+on entry to the paragraph, fix the upstream copybook so a
+`REDEFINES` does not lie about the data, or add an `IF NUMERIC` guard
+before the arithmetic. The actual debugging — reading a SYSUDUMP,
+locating the failing instruction in the compile listing, mapping it
+back to a COBOL line number — is its own lesson.
+
+</Callout>
+
+## A worked example: a 70-byte customer record
+
+A real copybook fragment from a billing system:
+
+```cobol
+01  CUSTOMER-RECORD.
+    05  CUST-ID             PIC X(8).               *> 8
+    05  CUST-NAME           PIC X(30).              *> 30
+    05  CUST-STATUS         PIC X.                  *> 1
+    05  CUST-TYPE           PIC 9.                  *> 1
+    05  BALANCE-DUE         PIC S9(9)V99 COMP-3.    *> 6
+    05  CREDIT-LIMIT        PIC S9(9)V99 COMP-3.    *> 6
+    05  LAST-PAY-DATE       PIC 9(8).               *> 8 (YYYYMMDD)
+    05  RECORD-COUNTER      PIC S9(7) COMP-3.       *> 4
+    05  FILLER              PIC X(6).               *> 6 (reserved)
+```
+
+**Total: 70 bytes.** Every record in this VSAM file is exactly 70 bytes,
+no more, no less. If a downstream extract job assumes 68 bytes — say,
+because someone forgot the `FILLER` — every column past offset 60 will
+be misaligned, and the symptom will be either an S0C7 (if the extract
+arithmetic'd a column it thought was numeric) or silently wrong dollar
+totals (if it did not).
+
+This kind of byte arithmetic is the daily mental work of a maintainer.
+You will do it from a copybook on screen, ideally without a pencil. The
+shortcut to internalising it is to do the math out loud the first 30
+times and stop counting on your fingers around record number 50.
+
+## MOVE compatibility
+
+`MOVE source TO target` is the COBOL workhorse, and the rules are
+tedious but knowable.
+
+| Source       | Target        | Behaviour                                                |
+| ------------ | ------------- | -------------------------------------------------------- |
+| `PIC X(n)`   | `PIC X(m)`    | Copy left-aligned, pad or truncate on the right          |
+| `PIC 9(n)`   | `PIC 9(m)`    | Copy aligned on V (or right-justified), pad on the left  |
+| `PIC 9`      | `PIC X`       | Legal — copies the zoned bytes verbatim as characters    |
+| `PIC X`      | `PIC 9`       | **Legal but unchecked** — the next arithmetic may S0C7   |
+| zoned `PIC 9`| `COMP-3`      | Compiler emits a `PACK` conversion. Free.                |
+| `COMP-3`     | zoned `PIC 9` | Compiler emits an `UNPK` conversion.                     |
+| `PIC X`      | `COMP-3`      | Rejected by modern compilers; older code with `NUMPROC` may compile, with predictable consequences |
+
+The general rule: **moves between same-USAGE numeric fields are safe.
+Moves across USAGEs trigger automatic conversion. Moves involving
+`PIC X` are character copies and get no validation.**
+
+Most production S0C7 ABENDs trace to a moment when somebody moved a
+character field into a numeric field, the runtime did exactly what it
+was told (a byte copy), and the ABEND fired three statements later
+when the field was finally arithmetic'd.
+
+## Lab: predict, then run
+
+The program below declares fields of each kind, MOVEs between them, and
+DISPLAYs the result. Read it first, predict the output, then run it.
+
+<CodeLab
+  lessonId="cobol/data-layout/pic-and-comp3"
+  runtime="server"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. PIC-DEMO.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-NAME      PIC X(10) VALUE "ALICE".
+01  WS-AGE-Z     PIC 9(3)  VALUE 42.
+01  WS-AGE-P     PIC S9(3) COMP-3.
+01  WS-MONEY-P   PIC S9(7)V99 COMP-3 VALUE 1234.56.
+01  WS-MONEY-D   PIC -ZZZZ9.99.
+PROCEDURE DIVISION.
+    MOVE WS-AGE-Z TO WS-AGE-P.
+    MOVE WS-MONEY-P TO WS-MONEY-D.
+    DISPLAY "name=[" WS-NAME "]".
+    DISPLAY "age zoned=" WS-AGE-Z.
+    DISPLAY "age packed (display)=" WS-AGE-P.
+    DISPLAY "money packed (display)=" WS-MONEY-D.
+    STOP RUN.`}
+  hints={[
+    "PIC X(10) VALUE 'ALICE' is space-padded on the right — the brackets in the DISPLAY make this visible.",
+    "MOVE between zoned and packed converts automatically; the digits are the same.",
+    "PIC -ZZZZ9.99 is an edited (display) PIC: leading zeros are blanked, the sign is shown only when negative."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/data-layout/pic-and-comp3"
+  questions={[
+    {
+      prompt: "How many bytes does PIC S9(11)V99 COMP-3 occupy?",
+      options: [
+        { id: "a", label: "7", correct: true, explanation: "ceil((11 + 2 + 1) / 2) = ceil(14 / 2) = 7. Don't forget the sign nibble — it's the +1." },
+        { id: "b", label: "13" },
+        { id: "c", label: "14" },
+        { id: "d", label: "8" },
+      ],
+    },
+    {
+      prompt: "An uninitialized COMP-3 field is X'00 00 00'. What happens when ADD 1 hits it?",
+      options: [
+        { id: "a", label: "It's treated as zero and the result is X'00 00 1C'." },
+        { id: "b", label: "S0C7 data exception.", correct: true, explanation: "The last nibble (X'0') is not a valid sign. C, D, and F are the only legal sign nibbles." },
+        { id: "c", label: "Compiler error." },
+        { id: "d", label: "Result is X'00 00 01' with sign +." },
+      ],
+    },
+    {
+      prompt: "MOVE 'BANANA' TO a PIC 9(6) field, then ADD 1. What happens?",
+      options: [
+        { id: "a", label: "Compile error." },
+        { id: "b", label: "Result is 1, alpha is treated as zero." },
+        { id: "c", label: "S0C7 at runtime.", correct: true, explanation: "The MOVE is legal — character copy into zoned decimal. But the bytes are not valid zoned digits. The next arithmetic faults." },
+        { id: "d", label: "Result is the string BANANB." },
+      ],
+    },
+    {
+      prompt: "Which two statements about MOVE are true?",
+      multi: true,
+      options: [
+        { id: "a", label: "Numeric MOVE aligns on the implied decimal point.", correct: true, explanation: "Numeric MOVE aligns on V (or right-justifies if there is no V)." },
+        { id: "b", label: "Alphanumeric MOVE is right-justified." },
+        { id: "c", label: "Alphanumeric MOVE pads on the right with spaces.", correct: true, explanation: "PIC X is left-aligned and pads with X'40' (EBCDIC space) on the right." },
+        { id: "d", label: "MOVE always validates that bytes match the target PIC." },
+      ],
+    },
+    {
+      prompt: "In zoned decimal, the value -25 in PIC S9(2) is which two bytes (EBCDIC)?",
+      options: [
+        { id: "a", label: "X'F2 D5'", correct: true, explanation: "Last byte's zone nibble carries the sign. D = negative." },
+        { id: "b", label: "X'F2 F5'" },
+        { id: "c", label: "X'D2 F5'" },
+        { id: "d", label: "X'2D 5F'" },
+      ],
+    },
+  ]}
+/>
+
+## Up next
+
+The next lesson uses these fundamentals to read a real-world copybook
+with `REDEFINES` (the same bytes, two different shapes) and `OCCURS`
+(repeating groups, fixed and variable). Together they turn a flat
+record into a dynamic structure, and they account for most of the
+"why does this program look like that" moments a new maintainer has
+in their first month.
