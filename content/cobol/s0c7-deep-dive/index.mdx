@@ -1,0 +1,466 @@
+---
+module: abends
+order: 3
+title: The S0C7 deep dive
+summary: A complete worked example from "the job ABENDed at 2am" to "here is the line that caused it." Distinguishes surface symptoms (the failing line) from root causes (the upstream bad data), and catalogs the five common S0C7 patterns by signature.
+estimatedMinutes: 32
+prerequisites: [hello-world, divisions, pic-and-comp3, anatomy-of-an-abend, reading-a-sysudump]
+objectives:
+  - Walk a real S0C7 from page to fix without assistance.
+  - Recognise the five common S0C7 patterns by their dump signature.
+  - Distinguish "where it ABENDed" from "what caused the bad data."
+  - Choose between a defensive fix at the failing line and a root-cause fix upstream.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: A SYSUDUMP shows a 5-byte COMP-3 field containing X'40 40 40 40 40' (all EBCDIC spaces). What pattern is this most likely?
+      options:
+        - { id: a, label: "A PIC X field containing spaces is being interpreted as packed-decimal — almost certainly through a REDEFINES that lies, or a MOVE from a character source.", correct: true, explanation: "X'40' is EBCDIC space. A 5-byte COMP-3 field never legitimately contains all spaces; the bytes came from a character context. Track the source that wrote those bytes." }
+        - { id: b, label: "Normal initialised state for an unsigned packed field." }
+        - { id: c, label: "A null indicator from DB2." }
+        - { id: d, label: "An ASCII-encoded value that needs translation." }
+    - prompt: The dump shows a COMP-3 field with bytes X'00 00 00 00 00'. Most likely cause?
+      options:
+        - { id: a, label: "Uninitialized field — never assigned, never INITIALIZE'd, used in arithmetic.", correct: true, explanation: "All-zeros COMP-3 is the canonical 'forgot to initialise' bug. The fix is to set the field on entry to the paragraph (or in the WORKING-STORAGE VALUE clause)." }
+        - { id: b, label: "DB2 returned NULL." }
+        - { id: c, label: "Hardware corruption." }
+        - { id: d, label: "Caused by ROUNDED truncation." }
+    - prompt: The dump shows a 6-byte zoned field X'F2 F4 F2 F0 F2 F0' which is being arithmetic'd through a REDEFINES that calls it COMP-3. What's wrong?
+      options:
+        - { id: a, label: "The bytes are zoned-decimal '242020' but interpreted as packed — the X'F0' bytes are being read as packed digits, and the last byte's sign nibble (X'0') is invalid for COMP-3.", correct: true, explanation: "Type confusion via REDEFINES. The SOURCE of the bytes wrote them as zoned; the consumer read them as packed. Fix: either align the REDEFINES with the actual usage, or convert explicitly with MOVE before the arithmetic." }
+        - { id: b, label: "Nothing — those are valid packed digits." }
+        - { id: c, label: "The field needs to be DISPLAY-edited." }
+        - { id: d, label: "EBCDIC translation is missing." }
+    - prompt: The S0C7 happens at the 50,001st record in a million-row batch. Records 1-50,000 processed cleanly. What is the high-probability root cause?
+      options:
+        - { id: a, label: "A specific data row at position 50,001 has bad bytes — the program is correct for typical data but doesn't validate input.", correct: true, explanation: "Failure at a specific row means the data is the variable, not the code. The fix is usually upstream (in the data) or defensive (validate before arithmetic)." }
+        - { id: b, label: "The program is leaking memory and ran out at 50,000 rows." }
+        - { id: c, label: "The compiler optimization broke for that input size." }
+        - { id: d, label: "A timing race condition." }
+    - prompt: Which two of these are correct fixes for an S0C7 caused by an unverified MOVE from a PIC X source to a PIC 9 target?
+      multi: true
+      options:
+        - { id: a, label: "Add IF source-field IS NUMERIC before the MOVE; only MOVE if numeric, else handle the bad data explicitly.", correct: true, explanation: "Defensive validation at the failing site. Catches bad data, logs it, and prevents the ABEND. Right fix when the data origin is uncontrolled (external feed, user input)." }
+        - { id: b, label: "Find the upstream source that produces non-numeric data and fix it there.", correct: true, explanation: "Root-cause fix. Right when you control the source. Better long-term but sometimes politically harder than a defensive fix at the site." }
+        - { id: c, label: "Ignore it — the compiler should handle the MOVE correctly." }
+        - { id: d, label: "Compile with NUMPROC(NOPFD) and the problem goes away." }
+---
+
+# The S0C7 deep dive
+
+You have read about ABEND categories and the structure of a SYSUDUMP.
+This lesson is the complete walkthrough — one specific S0C7 in one
+specific program, from the 2am page to the morning standup, with the
+methodology applied end to end. By the end of it you should be able to
+work a real S0C7 ticket without assistance.
+
+## The scenario
+
+It is 2:14am. Your phone rings. The on-call operator says:
+
+> "BATCH001, step PAYBL010, ABEND S0C7. Started 0145, failed 0212.
+> Customer-facing systems hit it at 0500 if it's not done."
+
+You log on, open SDSF, and find the job in the held output queue.
+Three hours and 14 minutes until the customer impact. Plenty of time
+if you work the methodology; not enough if you panic.
+
+## Step 1 — JESMSGLG and JESYSMSG
+
+In SDSF, you place `?` against the job and then `S` against
+`JESMSGLG`. The relevant section:
+
+```
+IEF403I  BATCH001 - STARTED - TIME=01.45.23
+...
+IEC130I  CUSTPRINT DD STATEMENT MISSING            ← informational
+...
+IEF450I  BATCH001 PAYBL010 - ABEND=S0C7 U0000 REASON=00000000
+IEF453I  BATCH001 - JOB FAILED - JCL ERROR
+```
+
+That confirms what the operator told you: `S0C7`, step `PAYBL010`. The
+informational message about a missing `CUSTPRINT` DD is unrelated
+noise — pre-existing, not what failed the job.
+
+`JESYSMSG` shows the system messages from the failing step including
+storage allocations, but for an S0C7 it does not add information.
+
+## Step 2 — open the CEEDUMP
+
+The job has both a `SYSUDUMP` and a `CEEDUMP` in its spool. The
+`CEEDUMP` is the readable one; that's where you start.
+
+The top section of a CEEDUMP looks like:
+
+```
+CEE3204S  The system detected a protection exception
+                              (System Completion Code=0C7).
+
+Information for enclave PAYBL010
+
+Information for thread 8000000000000000
+
+Traceback:
+  DSA Addr  Program Unit Entry      Statement   Load Mod    Service
+  005FA8C0  PAYBL010     PAYBL010   189         PAYBL010    LE6500
+  005FA600  CEEBINIT     CEEBINIT   0           CEEPLPKA    HLE7790
+```
+
+Two key facts:
+
+- **Failing program**: `PAYBL010`.
+- **Failing statement**: line **189** of the source.
+
+You have your line number already. The CEEDUMP did most of the lookup
+for you.
+
+## Step 3 — read the source
+
+You open `PAYBL010.cbl` (or its production equivalent) and navigate
+to line 189:
+
+```cobol
+*  Lines 180-198
+COMPUTE-OVERTIME.
+    IF EMP-HOURS > 40
+        COMPUTE OT-HOURS = EMP-HOURS - 40
+        COMPUTE OT-PAY ROUNDED =
+            OT-HOURS * EMP-RATE * OVERTIME-MULT       *>  line 189
+    END-IF.
+    ADD OT-PAY TO PERIOD-TOTAL.
+```
+
+Line 189 is the `COMPUTE OT-PAY ROUNDED = OT-HOURS * EMP-RATE *
+OVERTIME-MULT`. Three operands. One of them has bad bytes. Which?
+
+The data divisions tell you:
+
+```cobol
+01  EMP-HOURS         PIC S9(3)V99   COMP-3.
+01  EMP-RATE          PIC S9(3)V99   COMP-3.
+01  OVERTIME-MULT     PIC 9V99       COMP-3.
+01  OT-HOURS          PIC S9(3)V99   COMP-3.
+01  OT-PAY            PIC S9(7)V99   COMP-3.
+```
+
+All packed-decimal. Any of the three operands could be the cause.
+Now you need the dump's storage to see which.
+
+## Step 4 — read the bytes
+
+Below the traceback, the CEEDUMP includes the storage of the failing
+program's working-storage area. You scroll until you find a section
+labeled `Working Storage Storage Block` (or use a primary command to
+search for `WORKING`).
+
+The relevant offsets come from the compile listing's `MAP` section
+(your shop's standard compile options should produce one). The MAP
+might say:
+
+```
+DATA DIVISION MAP
+
+LVL  SOURCE NAME      BASE     DISPL  DEFINITION
+01   EMP-HOURS        BLW=00   00C8   PIC S9(3)V99 COMP-3 (3 bytes)
+01   EMP-RATE         BLW=00   00CB   PIC S9(3)V99 COMP-3 (3 bytes)
+01   OVERTIME-MULT    BLW=00   00CE   PIC 9V99 COMP-3 (2 bytes)
+01   OT-HOURS         BLW=00   00D0   PIC S9(3)V99 COMP-3 (3 bytes)
+01   OT-PAY           BLW=00   00D3   PIC S9(7)V99 COMP-3 (5 bytes)
+```
+
+`BLW=00` is the base register; `DISPL` is the displacement. So if the
+working-storage block starts at address `00500200`, then:
+
+- `EMP-HOURS` is at `005002C8`, 3 bytes.
+- `EMP-RATE` is at `005002CB`, 3 bytes.
+- `OVERTIME-MULT` is at `005002CE`, 2 bytes.
+
+In the dump:
+
+```
+005002C0   00000000 00000000 04527C04 525C0103   *............... *
+005002D0   06204C00 0000F0F0 0F404040 40000000   *.....{   ........*
+```
+
+Decoding:
+
+- `EMP-HOURS` at `005002C8`: bytes `04 52 7C` — packed `+0452.7`. Wait,
+  PIC S9(3)V99 is 3 bytes (digits 5 + sign nibble = 6 nibbles = 3
+  bytes), value `+04527.` no, with V99 it's 3 digits then 2 decimals,
+  so the bytes encode `045.27` as `04 52 7C` (sign nibble C =
+  positive). Valid.
+- `EMP-RATE` at `005002CB`: bytes `04 52 5C` — packed `+045.25`.
+  Valid.
+- `OVERTIME-MULT` at `005002CE`: bytes `01 03` — packed `+01.3` for
+  PIC 9V99. **Wait** — that's only 1.3, but the field is `9V99` (one
+  whole digit, two decimals = 3 nibbles + 1 sign nibble = 4 nibbles =
+  2 bytes). So the bytes are `01 03` interpreted as digit-1, digit-0,
+  digit-3, sign-? (the last nibble is the sign). The sign nibble is
+  `3` — **not a valid sign**. Valid signs are `C`, `D`, or `F`.
+
+There it is. `OVERTIME-MULT` is corrupted. Last nibble `3` is the
+problem.
+
+## Step 5 — find the upstream cause
+
+The COMPUTE on line 189 isn't the bug. The COMPUTE is just where the
+program tripped over the bad data. The actual bug is **wherever
+`OVERTIME-MULT` got that value**.
+
+You search the source for assignments to `OVERTIME-MULT`:
+
+```cobol
+*  Line 47:
+01  OVERTIME-MULT  PIC 9V99 COMP-3 VALUE 1.50.
+
+*  Line 122 (in INITIALIZE-PARAMS):
+    READ PARAM-FILE INTO WS-PARAM-RECORD
+        AT END
+            DISPLAY "no params"
+            STOP RUN
+    END-READ.
+    MOVE WS-PARAM-OT-MULT TO OVERTIME-MULT.
+```
+
+So `OVERTIME-MULT` starts at 1.50 (the VALUE clause), then on line 122
+gets overwritten with the value from the parameter file. The parameter
+file is the source.
+
+You browse the parameter file (a small ISPF dataset). Records look
+like:
+
+```
+EMP-CLASSCODE-A   OT-MULT=1.50  COLA=0.025
+EMP-CLASSCODE-B   OT-MULT=1.50  COLA=0.030
+EMP-CLASSCODE-C   OT-MULT=1.5O  COLA=0.025      ← look closely
+```
+
+The third row has `OT-MULT=1.5O`. **Capital O**, not zero. Someone
+edited the parameter file at 1pm yesterday and typo'd a letter O for
+a digit 0. The MOVE from the parameter into `OVERTIME-MULT` produced
+a packed field with bytes that look numeric on a casual read but have
+a bad sign nibble.
+
+That is the root cause. The COMPUTE at line 189 is just the witness.
+
+## Step 6 — choose the fix
+
+You have two correct fixes, and which you choose depends on your
+shop's culture and the time pressure.
+
+### The site fix (defensive)
+
+Add validation at line 122:
+
+```cobol
+READ PARAM-FILE INTO WS-PARAM-RECORD
+    AT END ...
+END-READ.
+
+IF WS-PARAM-OT-MULT IS NUMERIC
+    MOVE WS-PARAM-OT-MULT TO OVERTIME-MULT
+ELSE
+    DISPLAY "PARAM ERROR: OT-MULT non-numeric: "
+            WS-PARAM-OT-MULT
+            ", using default 1.50"
+    MOVE 1.50 TO OVERTIME-MULT
+END-IF.
+```
+
+This catches the bad data, logs it, defaults safely, and continues.
+
+### The source fix
+
+Edit the parameter file, change `1.5O` back to `1.50`, restart the
+job. The single character was a typo; correcting it makes the same
+program work.
+
+### What to do at 2am
+
+At 2am the right answer is the **source fix** — change the parameter
+file, restart the job, get back to bed. The site fix is a code change
+that needs review, testing, and a promotion through the change
+process. That belongs in tomorrow's standup as a hardening item.
+
+Both should happen. Production-ready code does not trust its inputs;
+production-ready operations do not let a single typo silently corrupt
+overnight batch.
+
+## Step 7 — restart
+
+Once the parameter file is fixed, you restart the job from the failed
+step. With most schedulers, this is a one-line change to the JCL or a
+scheduler command:
+
+```jcl
+//STEP010  EXEC PGM=PAYBL010,REGION=0M,
+//             COND=(0,LT,STEP005)        ← keep upstream success guard
+```
+
+Or via the scheduler's restart command. The job runs through to
+completion at 0245. You file an incident note for the morning and go
+back to bed.
+
+## The five S0C7 patterns by signature
+
+After enough dumps you recognise patterns by what the failing field's
+bytes look like.
+
+| Bytes (5-byte COMP-3 example) | Pattern | Likely cause |
+| ----------------------------- | ------- | ------------ |
+| `00 00 00 00 00` | All zeros | Uninitialized field — never assigned, never INITIALIZE'd |
+| `40 40 40 40 40` | All EBCDIC spaces | A `PIC X` field full of spaces being read as numeric (REDEFINES lies, or MOVE from char source) |
+| `F0 F0 F0 F0 FF` | Looks like zoned digits | Type confusion — zoned bytes being read as packed |
+| `12 34 56 78 9?` | Last nibble odd / non-sign | Bad data ingested from external source (typo, encoding issue, truncation) |
+| `XX XX XX XX XX`  with sane digits | Plausible-looking | The arithmetic itself overflowed, or two fields' decimal alignments disagree silently |
+
+The first four are recognisable on sight after a dozen dumps. The
+fifth is the hardest because the field looks fine — those usually
+require checking two operands' decimal alignment by reading the
+listing.
+
+## Symptom vs root cause
+
+A maintainer's reflex on an S0C7 should be: **the failing line is the
+witness, not the suspect.** The witness can sometimes be hardened to
+catch bad data (the defensive fix); the actual bug is wherever the
+bad data came from.
+
+For external data sources (parameter files, customer feeds, screen
+input) the right answer is usually both: harden the consuming code so
+it cannot ABEND on bad input, AND fix or alert on the upstream.
+
+For internal data flows (program A writes a file that program B
+reads), the right answer is to fix program A. Hardening program B
+against program A's bugs is technical debt; you trade a clear ABEND
+for a quiet wrong number.
+
+<Callout kind="warn" title="Don't fix the wrong thing">
+
+A common junior-maintainer mistake on an S0C7: edit the failing line
+to add `IF something IS NUMERIC` and ship it without finding the
+upstream cause. Now the program stops ABENDing — but the bad data
+silently flows downstream, and a different program ABENDs tomorrow,
+or a financial report is silently wrong.
+
+The correct loop is: **hard-fail at the failing line in production**
+(so you do not lose visibility), **soft-fail on a defensive check
+where input is genuinely uncontrolled** (external feeds), and **fix
+the source** wherever you can reach it. Hardening every site without
+fixing sources is how a production codebase decays into a swamp of
+"if-numeric" checks that hide bugs.
+
+</Callout>
+
+## Lab: simulate the diagnostic loop
+
+The program below sets up the same shape of bug (a non-digit in a
+field meant for arithmetic) and demonstrates both the failure path
+and the defensive fix.
+
+<CodeLab
+  lessonId="cobol/abends/s0c7-deep-dive"
+  runtime="server"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. S0C7-WALK.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-PARAM-IN     PIC X(4) VALUE "1.5O".  *> note the letter O
+01  WS-PARAM-CLEAN  PIC X(4) VALUE "1.50".  *> the corrected value
+01  WS-OT-MULT      PIC 9V99 COMP-3.
+01  WS-HOURS        PIC S9(3)V99 COMP-3 VALUE 8.00.
+01  WS-RATE         PIC S9(3)V99 COMP-3 VALUE 25.00.
+01  WS-PAY          PIC S9(7)V99 COMP-3.
+
+PROCEDURE DIVISION.
+    DISPLAY "--- attempt 1: defensive check, bad data ---".
+    IF WS-PARAM-IN IS NUMERIC
+        COMPUTE WS-OT-MULT = FUNCTION NUMVAL(WS-PARAM-IN)
+    ELSE
+        DISPLAY "  param failed numeric check: [" WS-PARAM-IN "]"
+        DISPLAY "  using default 1.50"
+        MOVE 1.50 TO WS-OT-MULT
+    END-IF.
+
+    COMPUTE WS-PAY = WS-HOURS * WS-RATE * WS-OT-MULT.
+    DISPLAY "  computed pay = " WS-PAY.
+
+    DISPLAY "--- attempt 2: defensive check, clean data ---".
+    IF WS-PARAM-CLEAN IS NUMERIC
+        COMPUTE WS-OT-MULT = FUNCTION NUMVAL(WS-PARAM-CLEAN)
+    END-IF.
+
+    COMPUTE WS-PAY = WS-HOURS * WS-RATE * WS-OT-MULT.
+    DISPLAY "  computed pay = " WS-PAY.
+    STOP RUN.`}
+  hints={[
+    "The IS NUMERIC class test is the fast defensive check before any arithmetic.",
+    "FUNCTION NUMVAL converts an alphanumeric string to a number — but only after IS NUMERIC has passed.",
+    "Without the defensive check, the COMPUTE on the bad data would S0C7 in production."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/abends/s0c7-deep-dive"
+  questions={[
+    {
+      prompt: "5-byte COMP-3 field containing X'40 40 40 40 40' (all EBCDIC spaces). Most likely?",
+      options: [
+        { id: "a", label: "PIC X spaces being interpreted as packed — REDEFINES lying or MOVE from char source.", correct: true, explanation: "Track the source that wrote those bytes." },
+        { id: "b", label: "Normal initialised state for unsigned packed." },
+        { id: "c", label: "DB2 null indicator." },
+        { id: "d", label: "ASCII needing translation." },
+      ],
+    },
+    {
+      prompt: "COMP-3 field with bytes X'00 00 00 00 00'?",
+      options: [
+        { id: "a", label: "Uninitialized field — never assigned, never INITIALIZE'd.", correct: true, explanation: "Canonical 'forgot to initialise'." },
+        { id: "b", label: "DB2 NULL." },
+        { id: "c", label: "Hardware corruption." },
+        { id: "d", label: "ROUNDED truncation." },
+      ],
+    },
+    {
+      prompt: "6-byte zoned field X'F2 F4 F2 F0 F2 F0' interpreted as COMP-3 — what's wrong?",
+      options: [
+        { id: "a", label: "Type confusion via REDEFINES — zoned bytes read as packed; last nibble X'0' invalid for COMP-3.", correct: true, explanation: "Source wrote zoned, consumer read packed. Fix the alignment or convert explicitly." },
+        { id: "b", label: "Nothing — valid packed digits." },
+        { id: "c", label: "Needs DISPLAY-edit." },
+        { id: "d", label: "EBCDIC translation missing." },
+      ],
+    },
+    {
+      prompt: "S0C7 at row 50,001 of a million-row batch; rows 1-50,000 OK. Likely cause?",
+      options: [
+        { id: "a", label: "A specific data row at 50,001 has bad bytes — code OK, but no input validation.", correct: true, explanation: "Failure at a specific row implicates the data, not the code." },
+        { id: "b", label: "Memory leak after 50,000 rows." },
+        { id: "c", label: "Compiler optimization break." },
+        { id: "d", label: "Timing race." },
+      ],
+    },
+    {
+      prompt: "Which two are correct fixes for an S0C7 from MOVE PIC X to PIC 9?",
+      multi: true,
+      options: [
+        { id: "a", label: "IF source IS NUMERIC before the MOVE.", correct: true, explanation: "Defensive validation. Right when source is uncontrolled." },
+        { id: "b", label: "Fix the upstream that produces non-numeric data.", correct: true, explanation: "Root cause. Right when you control the source." },
+        { id: "c", label: "Ignore — compiler should handle." },
+        { id: "d", label: "NUMPROC(NOPFD) makes it disappear." },
+      ],
+    },
+  ]}
+/>
+
+## Up next
+
+The next lesson is **condition handling** — `DECLARATIVES`, `ON SIZE
+ERROR` recap, `FILE STATUS` discipline, and `AT END`. The patterns
+that turn potentially-failing operations into ones with explicit
+recovery paths. Once you understand condition handling, you can
+choose whether each operation in your program should hard-fail (and
+produce an ABEND that gets investigated) or soft-fail (and produce a
+log line plus a default value).

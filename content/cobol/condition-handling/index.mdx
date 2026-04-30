@@ -1,0 +1,459 @@
+---
+module: abends
+order: 4
+title: Condition handling
+summary: DECLARATIVES, ON SIZE ERROR, FILE STATUS, AT END, and class tests — the verbs and clauses that turn implicit ABENDs into explicit recovery paths. The discipline that makes a program operationally trustworthy.
+estimatedMinutes: 25
+prerequisites: [hello-world, divisions, pic-and-comp3, anatomy-of-an-abend]
+objectives:
+  - Use FILE STATUS as a check-every-operation discipline rather than an afterthought.
+  - Place AT END and INVALID KEY phrases on every applicable verb.
+  - Write a DECLARATIVES section that handles file errors centrally.
+  - Choose between hard-fail (ABEND), soft-fail (log + continue), and structured recovery, deliberately.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: A FILE STATUS variable shows "35" after an OPEN INPUT. What does this code mean?
+      options:
+        - { id: a, label: "Dataset not found — the file referenced by the DD statement does not exist or is not accessible.", correct: true, explanation: "FILE STATUS 35 is 'file not present' on OPEN INPUT. The remediation is JCL-level: confirm the DSN, the catalog, and the disposition. The COBOL program is correct." }
+        - { id: b, label: "End of file." }
+        - { id: c, label: "Successful operation." }
+        - { id: d, label: "Record locked by another job." }
+    - prompt: A program reads a sequential file with READ WITH NO AT END phrase. The READ exhausts the file. What happens?
+      options:
+        - { id: a, label: "An ABEND is raised by the runtime.", correct: true, explanation: "Without AT END, COBOL has no idea what you want to happen on end-of-file. The runtime treats it as an unhandled condition and ABENDs (typically U4038 under LE)." }
+        - { id: b, label: "Silent continuation." }
+        - { id: c, label: "Compile error." }
+        - { id: d, label: "FILE STATUS is set and the program continues." }
+    - prompt: Where do DECLARATIVES live in a program?
+      options:
+        - { id: a, label: "At the very top of the PROCEDURE DIVISION, before any regular paragraph, surrounded by DECLARATIVES. and END DECLARATIVES.", correct: true, explanation: "DECLARATIVES is a section at the start of PROCEDURE DIVISION. Each declarative is itself a SECTION with a USE clause. END DECLARATIVES. marks the end; regular paragraphs follow." }
+        - { id: b, label: "In the DATA DIVISION." }
+        - { id: c, label: "Anywhere in the program — they're paragraphs." }
+        - { id: d, label: "In a separate copybook, COPY'd in." }
+    - prompt: "USE AFTER STANDARD ERROR PROCEDURE ON CUSTOMER-FILE — when does this declarative fire?"
+      options:
+        - { id: a, label: "After any I/O error on CUSTOMER-FILE that is not handled by a phrase like AT END or INVALID KEY on the failing verb.", correct: true, explanation: "Declaratives are catch-all handlers for I/O errors on a specific file. They fire if the verb's own AT END / INVALID KEY didn't catch the condition first. Used for centralized error logging and clean shutdown." }
+        - { id: b, label: "Only on EOF." }
+        - { id: c, label: "Before every READ." }
+        - { id: d, label: "Only when the FD declares STANDARD-ERROR-PROCEDURE." }
+    - prompt: 'IF source-field IS NUMERIC — when does this test return TRUE?'
+      options:
+        - { id: a, label: "When every byte of the field is a valid digit (and the sign nibble, if signed, is valid).", correct: true, explanation: "IS NUMERIC is the class test for 'this field's bytes will not S0C7 if used in arithmetic.' It's the right check before any MOVE-then-arithmetic on data from an external source." }
+        - { id: b, label: "When the field contains exactly numeric digits and nothing else, including no decimal point or sign symbols." }
+        - { id: c, label: "When the field is declared with PIC 9 or COMP-3." }
+        - { id: d, label: "Always — IS NUMERIC checks the declaration, not the data." }
+---
+
+# Condition handling
+
+Most COBOL programs you'll inherit will assume nothing ever fails. The
+file is always there, the record is always valid, the arithmetic
+always fits. Production reality breaks every one of those assumptions.
+Condition handling is the discipline of making those failures
+**explicit** — turning every implicit "and if this fails, the program
+ABENDs" into a deliberate "and if this fails, this is what we do."
+
+This lesson covers the language features for explicit handling
+(`AT END`, `INVALID KEY`, `ON SIZE ERROR`, `FILE STATUS`,
+`DECLARATIVES`) and the maintenance patterns that put them to work.
+
+## FILE STATUS — the discipline
+
+Every file in COBOL can have a `FILE STATUS` variable declared in the
+`SELECT` statement:
+
+```cobol
+ENVIRONMENT DIVISION.
+INPUT-OUTPUT SECTION.
+FILE-CONTROL.
+    SELECT CUSTOMER-FILE
+        ASSIGN TO CUSTFILE
+        ORGANIZATION IS INDEXED
+        ACCESS MODE IS SEQUENTIAL
+        RECORD KEY IS CUST-ID
+        FILE STATUS IS WS-CUST-STATUS.
+
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-CUST-STATUS    PIC X(2).
+```
+
+After every I/O verb on `CUSTOMER-FILE` (`OPEN`, `CLOSE`, `READ`,
+`WRITE`, `REWRITE`, `DELETE`, `START`), the runtime sets
+`WS-CUST-STATUS` to a 2-character code describing what happened.
+
+The codes are standardised:
+
+| Status | Meaning                                                        |
+| ------ | -------------------------------------------------------------- |
+| `00`   | Successful                                                     |
+| `02`   | Successful, but with a duplicate key found (informational)     |
+| `04`   | Successful, but record length wrong (informational)            |
+| `10`   | End of file (set by READ when the file exhausts)               |
+| `21`   | Sequence error — keys out of order on a sequential write       |
+| `22`   | Duplicate key on a write that doesn't allow it                 |
+| `23`   | Record not found (READ KEY, START, REWRITE on missing key)    |
+| `24`   | Boundary violation (write past defined record length)          |
+| `30`   | Permanent I/O error (a real hardware/system problem)           |
+| `34`   | Boundary violation (write past file's declared maximum)        |
+| `35`   | OPEN input on a file that does not exist                       |
+| `37`   | OPEN incompatible — wrong access mode for the file's RECFM     |
+| `39`   | Conflicting OPEN (already open, or RECFM/ORG mismatch)         |
+| `41`   | OPEN on a file that's already open                             |
+| `42`   | CLOSE on a file that isn't open                                |
+| `43`   | REWRITE/DELETE without a preceding successful READ             |
+| `46`   | Sequential READ after a previous READ failed at end-of-file    |
+| `47`   | OPEN INPUT on file that's been closed                          |
+| `93`   | (z/OS) Resource not available, often VSAM in exclusive use     |
+| `96`   | (z/OS) DD missing                                              |
+
+The discipline: **every I/O operation is followed by a status check.**
+The pattern most shops use is a paragraph called something like
+`CHECK-CUST-STATUS`:
+
+```cobol
+READ CUSTOMER-FILE
+    AT END SET END-OF-CUST-FILE TO TRUE
+END-READ.
+PERFORM CHECK-CUST-STATUS.
+
+* ... later ...
+
+CHECK-CUST-STATUS.
+    IF WS-CUST-STATUS NOT = "00" AND
+       WS-CUST-STATUS NOT = "10"
+        DISPLAY "CUSTOMER-FILE I/O failed: status="
+                WS-CUST-STATUS
+        DISPLAY "  last operation aborted"
+        MOVE 16 TO RETURN-CODE
+        STOP RUN
+    END-IF.
+```
+
+Three things this gets right:
+
+- **Explicit allow-list of acceptable codes.** `00` for success, `10`
+  for EOF (often expected). Anything else is an error.
+- **Single failure path** that logs and exits with a non-zero return
+  code so the JCL conditional logic can react.
+- **Centralised** — every read of `CUSTOMER-FILE` calls one paragraph.
+  When you change the error policy, you change one place.
+
+The maintainer's instinct: when reading a paragraph that does
+`READ FILE-X` without a status check immediately after, that is a
+candidate for a defensive-handling enhancement. Most legacy code
+checks status only on `OPEN` and `CLOSE` and trusts everything in
+between, which is exactly how a "permanent I/O error" turns into a
+silent partial run.
+
+## AT END and INVALID KEY — the verb-level handlers
+
+Every file verb that can fail has a phrase for catching the most
+common failure:
+
+| Verb       | Phrase            | Fires on                               |
+| ---------- | ----------------- | -------------------------------------- |
+| `READ` (sequential) | `AT END`     | EOF reached                            |
+| `READ` (random)     | `INVALID KEY` | Key not found in the file              |
+| `WRITE`             | `INVALID KEY` | Duplicate key, sequence, or boundary   |
+| `REWRITE`           | `INVALID KEY` | Same                                   |
+| `DELETE`            | `INVALID KEY` | Key not found                          |
+| `START`             | `INVALID KEY` | No record matches the START condition  |
+
+The phrase is optional. **Without it, an unhandled file condition
+ABENDs the program.**
+
+```cobol
+* Without AT END — ABENDs at EOF (typically U4038)
+READ CUSTOMER-FILE INTO WS-CUST-REC.
+
+* With AT END — explicit, no ABEND
+READ CUSTOMER-FILE INTO WS-CUST-REC
+    AT END
+        SET END-OF-CUST-FILE TO TRUE
+END-READ.
+```
+
+The maintainer's rule: every `READ` has an `AT END`. Every keyed
+operation has an `INVALID KEY`. Either you handle it explicitly, or
+you accept that production will hand you a U4038 some week.
+
+## DECLARATIVES — central error handlers
+
+The `DECLARATIVES` section is a special area at the top of the
+`PROCEDURE DIVISION` for catch-all handlers:
+
+```cobol
+PROCEDURE DIVISION.
+DECLARATIVES.
+
+CUSTOMER-FILE-ERROR SECTION.
+    USE AFTER STANDARD ERROR PROCEDURE ON CUSTOMER-FILE.
+HANDLE-CUST-ERROR.
+    DISPLAY "I/O error on CUSTOMER-FILE: status="
+            WS-CUST-STATUS.
+    DISPLAY "  last record key: " CUST-ID.
+    MOVE 16 TO RETURN-CODE.
+    PERFORM CLOSE-EVERYTHING.
+    STOP RUN.
+
+ANY-FILE-ERROR SECTION.
+    USE AFTER STANDARD ERROR PROCEDURE ON OUTPUT.
+HANDLE-OUTPUT-ERROR.
+    DISPLAY "I/O error on an output file".
+    MOVE 16 TO RETURN-CODE.
+    PERFORM CLOSE-EVERYTHING.
+    STOP RUN.
+
+END DECLARATIVES.
+
+* Regular paragraphs follow.
+
+MAIN-LINE.
+    OPEN INPUT CUSTOMER-FILE.
+    ...
+```
+
+The `USE AFTER STANDARD ERROR PROCEDURE` declarative is invoked
+**after** any I/O error on the named file (or class — you can also
+say `INPUT`, `OUTPUT`, `I-O`, or `EXTEND`) **if the failing verb
+didn't handle the condition explicitly**.
+
+Two things to know:
+
+1. **Verb-level phrases (`AT END`, `INVALID KEY`) take precedence.**
+   If the READ has `AT END`, the EOF condition fires that phrase, not
+   the declarative.
+2. **Declaratives are for catch-all handling.** Use them to centralise
+   "log and abort" logic instead of repeating it after every check.
+
+DECLARATIVES are common in production code for I/O. They're also used
+for error conditions during sort/merge (`USE AFTER ERROR ON SORT-FILE`).
+Less commonly, but legally, for reporting error events on display
+output.
+
+## ON SIZE ERROR — arithmetic recap
+
+From the data-layout module: arithmetic operations can lose precision
+or overflow. `ON SIZE ERROR` catches the overflow case:
+
+```cobol
+ADD 1 TO WS-COUNTER
+    ON SIZE ERROR
+        DISPLAY "counter overflow"
+        MOVE 0 TO WS-COUNTER
+END-ADD.
+```
+
+In the context of condition handling: this is the arithmetic
+equivalent of `AT END` on a READ. It moves a potential ABEND (silent
+truncation that ruins downstream calculations) into an explicit
+recovery path.
+
+The composite rule: **any operation that can fail has a corresponding
+clause for explicit handling. If you don't write the clause, you
+inherit whatever the runtime does — which is usually 'ABEND.'**
+
+## Class tests — IS NUMERIC and friends
+
+For data validation **before** arithmetic or file writes, COBOL
+provides class tests:
+
+```cobol
+IF WS-PARAM-IN IS NUMERIC
+    COMPUTE OT-MULT = FUNCTION NUMVAL(WS-PARAM-IN)
+ELSE
+    DISPLAY "bad parameter: [" WS-PARAM-IN "]"
+    MOVE 1.50 TO OT-MULT
+END-IF.
+```
+
+The class tests are:
+
+- `IS NUMERIC` — every byte is a valid digit, with a valid sign
+  nibble for signed fields. The "is this safe to ADD" test.
+- `IS ALPHABETIC` — every byte is A-Z, a-z, or space.
+- `IS ALPHABETIC-UPPER` — every byte is A-Z or space.
+- `IS ALPHABETIC-LOWER` — every byte is a-z or space.
+
+`IS NUMERIC` is the most useful, by far. Use it before any MOVE from
+character data into a numeric field, and before any arithmetic on a
+field whose origin you don't fully control.
+
+`IS NUMERIC` does **not** mean "looks like a number to a human." A
+field with `"1.5O"` (with the letter O) is **not** numeric. A field
+with `"$100.00"` is not numeric. A field with `"  100"` (leading
+spaces) is not numeric.
+
+If you need to convert "human-style" numbers (with signs, decimal
+points, leading spaces), use `FUNCTION NUMVAL`:
+
+```cobol
+COMPUTE WS-AMOUNT = FUNCTION NUMVAL("  -100.50").
+*  WS-AMOUNT = -100.50
+```
+
+`NUMVAL` accepts leading sign, leading spaces, decimal point, and
+trailing spaces. It throws an exception if the input doesn't look
+like a number — so still test with `IS NUMERIC` (or a custom validator)
+first if the input is genuinely uncontrolled.
+
+## Composing the patterns: a defended file loop
+
+Here is what a production-grade read loop looks like:
+
+```cobol
+PROCESS-CUSTOMER-FILE.
+    OPEN INPUT CUSTOMER-FILE.
+    PERFORM CHECK-CUST-STATUS.
+
+    PERFORM UNTIL END-OF-CUST-FILE OR ABORT-REQUESTED
+        READ CUSTOMER-FILE INTO WS-CUST-REC
+            AT END
+                SET END-OF-CUST-FILE TO TRUE
+            NOT AT END
+                PERFORM VALIDATE-CUST-REC
+                IF CUST-IS-VALID
+                    PERFORM PROCESS-CUST-REC
+                ELSE
+                    PERFORM LOG-BAD-CUST
+                END-IF
+        END-READ
+        PERFORM CHECK-CUST-STATUS
+    END-PERFORM.
+
+    CLOSE CUSTOMER-FILE.
+    PERFORM CHECK-CUST-STATUS.
+```
+
+What this code communicates to the next maintainer who reads it:
+
+- File operations are explicit about success and failure. There is no
+  silent path.
+- Records are validated before processing. Bad records get logged,
+  not ABEND'd over.
+- Every status is checked. The program will hard-fail on a permanent
+  I/O error, not run to a wrong total.
+- The `ABORT-REQUESTED` flag (typically set by a declarative or a
+  signal handler) lets the loop exit cleanly mid-file.
+
+This is not legacy "clever" code. It's slightly verbose, very
+predictable, and impossible to misread. It is also what production
+operations folks expect from any program they have to support at 2am.
+
+## Lab: predict, then run
+
+The program below reads a small inline sequence of "records" (mocked
+as a table) and demonstrates explicit `AT END`, class-test
+validation, and `ON SIZE ERROR`. Run it, then change `WS-INPUTS(3)`
+to invalid data and re-run to see the validation path fire.
+
+<CodeLab
+  lessonId="cobol/abends/condition-handling"
+  runtime="server"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. COND-DEMO.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-INPUTS.
+    05  FILLER  PIC X(5) VALUE "00100".
+    05  FILLER  PIC X(5) VALUE "00250".
+    05  FILLER  PIC X(5) VALUE "BADXX".
+    05  FILLER  PIC X(5) VALUE "99999".
+01  WS-INPUT-TABLE REDEFINES WS-INPUTS.
+    05  WS-INPUT  PIC X(5) OCCURS 4 TIMES.
+
+01  WS-RUNNING       PIC 9(7) VALUE 0.
+01  WS-AMOUNT        PIC 9(5).
+01  WS-IX            PIC 9(2) VALUE 0.
+01  WS-OK-COUNT      PIC 9(2) VALUE 0.
+01  WS-BAD-COUNT     PIC 9(2) VALUE 0.
+
+PROCEDURE DIVISION.
+    PERFORM VARYING WS-IX FROM 1 BY 1 UNTIL WS-IX > 4
+        IF WS-INPUT(WS-IX) IS NUMERIC
+            MOVE WS-INPUT(WS-IX) TO WS-AMOUNT
+            ADD WS-AMOUNT TO WS-RUNNING
+                ON SIZE ERROR
+                    DISPLAY "running total overflow at ix=" WS-IX
+            END-ADD
+            ADD 1 TO WS-OK-COUNT
+        ELSE
+            DISPLAY "skipping non-numeric input at ix=" WS-IX
+                    " value=[" WS-INPUT(WS-IX) "]"
+            ADD 1 TO WS-BAD-COUNT
+        END-IF
+    END-PERFORM.
+
+    DISPLAY "final running total: " WS-RUNNING.
+    DISPLAY "  ok=" WS-OK-COUNT ", bad=" WS-BAD-COUNT.
+    STOP RUN.`}
+  hints={[
+    "IS NUMERIC catches the BADXX entry without an ABEND.",
+    "ON SIZE ERROR catches a hypothetical overflow on the 7-digit running total.",
+    "Both ok and bad counters are tracked — you know how many records made it."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/abends/condition-handling"
+  questions={[
+    {
+      prompt: "FILE STATUS '35' after OPEN INPUT — what?",
+      options: [
+        { id: "a", label: "Dataset not found.", correct: true, explanation: "JCL-level fix: confirm DSN and catalog." },
+        { id: "b", label: "End of file." },
+        { id: "c", label: "Successful." },
+        { id: "d", label: "Record locked." },
+      ],
+    },
+    {
+      prompt: "READ with no AT END phrase, file exhausts. What happens?",
+      options: [
+        { id: "a", label: "ABEND (typically U4038 under LE).", correct: true, explanation: "No AT END means COBOL has no idea what you want; runtime ABENDs the program." },
+        { id: "b", label: "Silent continuation." },
+        { id: "c", label: "Compile error." },
+        { id: "d", label: "Status set, program continues." },
+      ],
+    },
+    {
+      prompt: "Where do DECLARATIVES live?",
+      options: [
+        { id: "a", label: "Top of PROCEDURE DIVISION, between DECLARATIVES. and END DECLARATIVES.", correct: true, explanation: "Special section before regular paragraphs." },
+        { id: "b", label: "DATA DIVISION." },
+        { id: "c", label: "Anywhere as paragraphs." },
+        { id: "d", label: "In a separate copybook." },
+      ],
+    },
+    {
+      prompt: "USE AFTER STANDARD ERROR PROCEDURE ON CUSTOMER-FILE — when fires?",
+      options: [
+        { id: "a", label: "After any I/O error on CUSTOMER-FILE not handled by AT END / INVALID KEY on the verb.", correct: true, explanation: "Catch-all after verb-level phrases." },
+        { id: "b", label: "Only on EOF." },
+        { id: "c", label: "Before every READ." },
+        { id: "d", label: "Only when FD declares it." },
+      ],
+    },
+    {
+      prompt: "IS NUMERIC — when is it TRUE?",
+      options: [
+        { id: "a", label: "Every byte is a valid digit (and valid sign nibble for signed).", correct: true, explanation: "The 'safe to arithmetic' test." },
+        { id: "b", label: "Field contains digits only, no sign or decimal." },
+        { id: "c", label: "Field is declared PIC 9 or COMP-3." },
+        { id: "d", label: "Always — checks declaration only." },
+      ],
+    },
+  ]}
+/>
+
+## Up next
+
+The final lesson in this module is **defensive patterns** —
+`INITIALIZE`, the proper use of `LOW-VALUES`/`HIGH-VALUES`/`SPACES`,
+and the structural patterns that prevent S0C7 / S0C4 from ever
+happening. The synthesis of everything in this module: how a
+maintenance-grade program is structured to be robust against the bad
+data and operational quirks it will inevitably encounter.

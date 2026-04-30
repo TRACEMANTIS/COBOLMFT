@@ -1,0 +1,374 @@
+---
+module: abends
+order: 1
+title: Anatomy of an ABEND
+summary: System completion codes vs user codes, the most common S-codes you'll see in production (S0C7, S0C4, S0C1, S322, S806, S913), where the ABEND message lives, and the diagnostic instinct that turns a panic into a triage.
+estimatedMinutes: 28
+prerequisites: [hello-world, divisions, pic-and-comp3]
+objectives:
+  - Distinguish system ABEND codes (S-prefix) from user codes (U-prefix).
+  - Decode the most common S-codes on sight — what each one is telling you about the failure.
+  - Locate the ABEND code, message text, and surrounding context in JES output.
+  - Choose the next diagnostic step from the code alone, before reading any code.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: A job ABENDs with S0C7. What category of bug is this?
+      options:
+        - { id: a, label: "Data exception — a decimal arithmetic instruction hit bytes that aren't a valid digit or sign nibble.", correct: true, explanation: "S0C7 is THE production COBOL ABEND. Always points at a packed-decimal or zoned-numeric field with bad data — uninitialized, overlaid, or never validated." }
+        - { id: b, label: "Protection exception — a load or store hit memory the program can't access." }
+        - { id: c, label: "Operation exception — the program tried to execute an illegal instruction." }
+        - { id: d, label: "Time exceeded — the job ran past its CPU limit." }
+    - prompt: S0C4 vs S0C7 — what is the practical difference for a maintainer?
+      options:
+        - { id: a, label: "S0C4 is a memory access violation (out-of-bounds, overlay); S0C7 is invalid decimal data.", correct: true, explanation: "Both surface from program checks but have different root causes. S0C4 is usually a subscript-out-of-range or a wild pointer. S0C7 is bad numeric data. Different diagnostics." }
+        - { id: b, label: "They're synonyms; the system just happens to pick one." }
+        - { id: c, label: "S0C4 only fires in batch; S0C7 only fires in CICS." }
+        - { id: d, label: "S0C7 is recoverable; S0C4 is not." }
+    - prompt: A job fails with S806. What does this mean?
+      options:
+        - { id: a, label: "An invalid SQL query." }
+        - { id: b, label: "The CALLed module wasn't found in any STEPLIB or system load library.", correct: true, explanation: "S806 = module not found. Causes: a missing STEPLIB, a misnamed load module, a fresh program that wasn't actually link-edited, or a path-like change in the load library concatenation." }
+        - { id: c, label: "Insufficient storage." }
+        - { id: d, label: "A RACF security violation." }
+    - prompt: U4038 — what kind of code is this?
+      options:
+        - { id: a, label: "A user ABEND emitted by the program (or its runtime). U4038 specifically is Language Environment when an unhandled condition is raised.", correct: true, explanation: "U-prefix means user ABEND. U4038 in particular is LE's go-to when a COBOL condition propagates without being handled — often a data exception that the program's own DECLARATIVES didn't catch." }
+        - { id: b, label: "A system code for a hardware error." }
+        - { id: c, label: "A non-zero return code from a job step." }
+        - { id: d, label: "A SYSPLEX coupling-facility error." }
+    - prompt: 'Where is the ABEND code displayed first when a job fails?'
+      options:
+        - { id: a, label: 'On the system console as an IEF-class message and in JESMSGLG ("System completion code = 0C7").', correct: true, explanation: "The console gets it immediately; SDSF shows it in JESMSGLG and the job log. The full diagnostic detail is in the SYSUDUMP (or CEEDUMP for LE programs)." }
+        - { id: b, label: "Only in the SYSUDUMP — you must locate and open the dump dataset." }
+        - { id: c, label: "Only in the program's own DISPLAY output." }
+        - { id: d, label: "Sent to the operator by email." }
+---
+
+# Anatomy of an ABEND
+
+A program ABENDs. The job log says `IEF450I CUSTBL01 PROCESS COMPLETION
+CODE 0C7`. Production email lights up. What you do next depends almost
+entirely on the code: a `0C7` and a `0C4` need different diagnostics; an
+`S806` and an `S913` are different problem entirely from data
+exceptions. The first ten seconds of triage is reading the code and
+choosing your next step.
+
+This lesson is the catalog: what each common code means, where to find
+it in the job output, and what to look at first when you see it. It is
+the lookup table you build muscle memory for — the same way a sysadmin
+recognises HTTP 503 vs 504.
+
+## The taxonomy
+
+ABENDs come in two flavors:
+
+- **System ABENDs (`S`-prefix)** — the operating system or a system
+  service detected an unrecoverable condition. The most common are
+  program checks (the CPU itself raised an interrupt: `S0Cx`),
+  dataset and module problems (`S8xx`), and time/storage exhaustion
+  (`S322`, `S804`).
+- **User ABENDs (`U`-prefix)** — the program (or its runtime) deliberately
+  signalled failure. The COBOL Language Environment uses `U4038` for
+  unhandled conditions; CICS uses 4-character codes like `AICA`,
+  `ASRA`, `ASRB`; Db2-prepared programs may emit user codes from the
+  precompiler stub.
+
+The first character tells you which family; the digits tell you which
+problem.
+
+## The S-codes you will see this week
+
+### S0C7 — data exception
+
+A decimal arithmetic instruction (`AP`, `SP`, `MP`, `DP`, `CP`, etc.)
+hit bytes that are not a valid packed decimal or zoned digit. This is
+**the** canonical COBOL ABEND. Causes:
+
+- An uninitialized `COMP-3` field (`X'00 00 00 00 00'` — no sign nibble).
+- A `PIC X` field full of spaces (`X'40 40 40 40 40'`) used in
+  arithmetic via a misplaced `MOVE` or a `REDEFINES` lying about the
+  type.
+- A "low-values" or binary-garbage record arithmetic'd as if numeric —
+  typically because the upstream file had a header row that the
+  program did not skip.
+- A `MOVE` from an unverified `PIC X` source into a `PIC 9` target
+  followed by arithmetic.
+
+Diagnostic: open the dump, find the failing instruction, identify the
+field it tried to operate on, look at the bytes. The bytes will tell
+you what is wrong. The S0C7 deep-dive lesson walks this end to end.
+
+### S0C4 — protection exception
+
+A memory access (load or store) hit storage the program is not
+authorized to touch. Causes:
+
+- A subscript out of range (without `SSRANGE` to catch it cleanly).
+- A `REDEFINES` of a smaller item, then accessing past the original's
+  end.
+- Following an uninitialized pointer (`SET ADDRESS OF X TO Y` where
+  `Y` is garbage).
+- Calling through a corrupted dispatch table or jumping into data.
+- A long-running program's stack getting overwritten (rare, but real).
+
+Diagnostic: same shape as S0C7, but the failing instruction will be a
+load/store rather than decimal arithmetic. The address being touched
+is in the dump's PSW context.
+
+### S0C1 — operation exception
+
+The CPU tried to execute a byte sequence that is not a valid
+instruction. In production COBOL this almost always means **a `CALL`
+landed on garbage** — either the loaded module is not what the program
+thinks it is, or the program jumped via a bad address.
+
+Common cause: the load library on STEPLIB has a mismatched version of
+a CALL'd subprogram, or a freshly-edited program was not actually
+relinked.
+
+### S0CB — divide exception
+
+Division by zero, or a divide that overflows the target register's
+width. In COBOL this is fired by `DIVIDE ... BY 0`, by `COMPUTE x = a /
+b` where `b` is zero, and by some packed-decimal `DP` instructions when
+the quotient does not fit.
+
+Often catchable cleanly with `ON SIZE ERROR` (it covers division by
+zero too).
+
+### S322 — time exceeded
+
+The job consumed more CPU time than its `TIME=` parameter allowed. This
+is a runaway loop or a missing exit condition, and the failing
+instruction in the dump is wherever the program happened to be when the
+timer fired — it is **not** the bug. Read the program's overall logic,
+not the dump.
+
+### S806 — module not found
+
+A `CALL` to a load module that is not findable in the STEPLIB
+concatenation, JOBLIB, or the system link list. The dump tells you the
+module name being sought.
+
+Causes:
+
+- The STEPLIB DD on the failing step is missing or wrong.
+- The module was renamed during promotion and a caller still
+  references the old name.
+- A fresh program was compiled but not link-edited (so no load module
+  was produced).
+
+This is a JCL or build problem, not a code problem. Fix the JCL or
+the build pipeline; do not edit COBOL.
+
+### S813 — dataset not found
+
+A program tried to `OPEN` a file whose dataset does not exist or is
+not where the JCL says it is. The dump or JESYSMSG tells you which
+DDname and which DSN.
+
+This is also a JCL problem most of the time. The fix is to check the
+JCL's DSN against the dataset catalog (`LISTC ENT('dsn')`).
+
+### S913 — dataset access denied
+
+The program has no RACF authority to read or write the dataset. This
+is a security configuration problem; you fix it by getting RACF
+authority granted, not by editing the program.
+
+## The U-codes you will see
+
+### U4038 — LE unhandled condition
+
+The Language Environment hit a condition (typically a program check,
+ie. an S0C-something at the CPU level) and no `DECLARATIVES` paragraph
+or `ON SIZE ERROR` handled it. LE then ABENDs the program with `U4038`
+and emits a CEEDUMP that includes the condition information that
+caused it.
+
+When you see a `U4038`, the **real** failure is usually an S0C7
+underneath. The CEEDUMP will tell you which one, and the diagnostic is
+the same as if the system had fired the S0C7 directly.
+
+### CICS 4-character codes
+
+In CICS, ABENDs use 4-character codes:
+
+- **AICA** — task ran past `RUNAWAY` interval (the CICS S322 analog).
+- **ASRA** — program check inside the task. The "ASRA" + the
+  underlying `0Cx` code together describe what happened. ASRA + 0C7
+  is "data exception in CICS code."
+- **ASRB** — operating system ABEND inside the task (typically a
+  Language Environment U4038).
+
+For maintenance work, an ASRA is "open the CICS auxiliary trace and
+the dump and treat it like the corresponding 0Cx in batch."
+
+## Where the code shows up
+
+When a job ABENDs, the code appears in three places:
+
+1. **The system console** — an `IEF450I` or similar message hits the
+   operator console immediately. This is what triggers the page.
+2. **JESMSGLG and JESYSMSG in the job's spool** — accessed via SDSF
+   (`SDSF.JL` / `?` to open job, then `JESMSGLG`). This is where you
+   look first, every time.
+3. **SYSUDUMP or CEEDUMP** — the full diagnostic dump, in a dataset
+   the JCL allocates with `//SYSUDUMP DD SYSOUT=*` or similar. The
+   next lesson covers reading this.
+
+The code on the console looks like:
+
+```
+IEF450I  CUSTBL01 STEP010 - ABEND=S0C7 U0000 REASON=00000000
+IEF453I  CUSTBL01 - JOB FAILED - JCL ERROR
+```
+
+The first line is the one you read. `S0C7` is the system completion
+code. `U0000` is "no user code" (it would say something like `U4038`
+if a user ABEND happened too). `REASON=` is supplementary context for
+some codes; `00000000` means no specific reason was set.
+
+## The 10-second triage
+
+When the page comes in and you see the code:
+
+| Code  | First question |
+| ----- | -------------- |
+| S0C7  | Which field has bad bytes? Read the dump for the failing instruction. |
+| S0C4  | Which subscript or pointer is out of range? Check for `SSRANGE` and recompile. |
+| S0C1  | Is the right module on STEPLIB? Did the last build link-edit? |
+| S0CB  | Where is the divide? Add `ON SIZE ERROR`. |
+| S322  | Where is the loop? It's somewhere with no exit. |
+| S806  | Which module is missing? Check STEPLIB. |
+| S813  | Which dataset? Check the catalog vs the JCL. |
+| S913  | Which dataset, and does the user have RACF READ/UPDATE? |
+| U4038 | What's the underlying condition in the CEEDUMP? Treat as the corresponding S-code. |
+| AICA  | Where is the runaway? Same as S322. |
+| ASRA  | What's the underlying program check? Same as the corresponding S-code. |
+
+This is the lookup that turns a pager alert into a triage workflow.
+Memorising it is the difference between a five-minute outage and a
+five-hour outage.
+
+<Callout kind="warn" title="The wrong instinct: re-run">
+
+When a batch job ABENDs, the first instinct of an inexperienced
+operator is "rerun it; maybe it'll work." Sometimes it does — a S813
+that resolves itself when an upstream extract lands, or a S322 on a
+day with unusually heavy CPU contention.
+
+But for **data-shaped ABENDs** (S0C7, S0C4, U4038), a rerun is almost
+certain to produce the same result. The bad data is either still on
+the file, still in the database, or still being computed by the
+upstream step. The maintainer's instinct should be **read the code
+first**, not "try the same thing again." Reruns waste the most
+expensive thing in batch operations: time.
+
+</Callout>
+
+## Lab: predict, then run
+
+The program below deliberately produces an S0C7 by moving alphabetic
+data into a numeric field and then performing arithmetic on it.
+
+Read the program, predict where it will fail, then run.
+
+<CodeLab
+  lessonId="cobol/abends/anatomy-of-an-abend"
+  runtime="server"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. ABEND-DEMO.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-AMOUNT-X     PIC X(5)        VALUE "12345".
+01  WS-AMOUNT-N     PIC S9(5)V99    COMP-3.
+01  WS-RESULT       PIC S9(5)V99    COMP-3.
+01  WS-TRASH        PIC X(5)        VALUE "ALICE".
+01  WS-DUBIOUS      PIC S9(5)       VALUE 0.
+
+PROCEDURE DIVISION.
+    DISPLAY "step 1: legal MOVE of digits string to numeric".
+    MOVE WS-AMOUNT-X TO WS-AMOUNT-N.
+    DISPLAY "  WS-AMOUNT-N = " WS-AMOUNT-N.
+
+    DISPLAY "step 2: legal arithmetic".
+    COMPUTE WS-RESULT = WS-AMOUNT-N * 2.
+    DISPLAY "  result = " WS-RESULT.
+
+    DISPLAY "step 3: ILLEGAL — moving alphabetic into numeric...".
+    MOVE WS-TRASH TO WS-DUBIOUS.
+    DISPLAY "  the MOVE itself was a byte copy. No error so far.".
+
+    DISPLAY "step 4: arithmetic on the dubious field — this should ABEND".
+    ADD 1 TO WS-DUBIOUS.
+    DISPLAY "  if you see this, the runtime is unusually forgiving".
+    STOP RUN.`}
+  hints={[
+    "Step 3's MOVE is legal — COBOL doesn't validate that the bytes are valid digits.",
+    "Step 4's ADD on those non-digit bytes is what triggers the data exception.",
+    "GnuCOBOL behaves similarly to Enterprise COBOL here; the ABEND surfaces as a runtime error rather than a system code, but the cause is identical."
+  ]}
+/>
+
+## Quiz
+
+<Quiz
+  lessonId="cobol/abends/anatomy-of-an-abend"
+  questions={[
+    {
+      prompt: "S0C7 — what category of bug?",
+      options: [
+        { id: "a", label: "Data exception — bad bytes hit by decimal arithmetic.", correct: true, explanation: "Canonical COBOL ABEND." },
+        { id: "b", label: "Protection exception." },
+        { id: "c", label: "Operation exception." },
+        { id: "d", label: "Time exceeded." },
+      ],
+    },
+    {
+      prompt: "S0C4 vs S0C7 — practical difference?",
+      options: [
+        { id: "a", label: "S0C4 is memory access violation; S0C7 is invalid decimal data.", correct: true, explanation: "Different root causes, different diagnostics." },
+        { id: "b", label: "Synonyms." },
+        { id: "c", label: "Batch vs CICS." },
+        { id: "d", label: "Recoverable vs not." },
+      ],
+    },
+    {
+      prompt: "S806?",
+      options: [
+        { id: "a", label: "Invalid SQL query." },
+        { id: "b", label: "CALLed module not found in STEPLIB or system load.", correct: true, explanation: "Module missing — JCL or build problem." },
+        { id: "c", label: "Insufficient storage." },
+        { id: "d", label: "RACF violation." },
+      ],
+    },
+    {
+      prompt: "U4038?",
+      options: [
+        { id: "a", label: "User ABEND from LE for an unhandled condition.", correct: true, explanation: "LE's catch-all when COBOL doesn't handle the condition." },
+        { id: "b", label: "Hardware error." },
+        { id: "c", label: "Non-zero return code." },
+        { id: "d", label: "Sysplex coupling error." },
+      ],
+    },
+    {
+      prompt: "Where does the ABEND code first appear?",
+      options: [
+        { id: "a", label: "Console as IEF-class message and in JESMSGLG.", correct: true, explanation: "Console for the page; SDSF/JESMSGLG for the maintainer." },
+        { id: "b", label: "Only in SYSUDUMP." },
+        { id: "c", label: "Only in DISPLAY output." },
+        { id: "d", label: "Operator email." },
+      ],
+    },
+  ]}
+/>
+
+## Up next
+
+The next lesson is **reading a SYSUDUMP** — opening the actual dump
+output, locating the PSW, mapping the failing instruction back to the
+compile listing, and reading the storage areas around the failing
+field. The skill that turns "S0C7" from a category into a specific bug
+in a specific paragraph.
