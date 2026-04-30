@@ -1,0 +1,28 @@
+node_modules
+.next
+.turbo
+out
+dist
+coverage
+*.tsbuildinfo
+
+.env
+.env.local
+.env.*.local
+!.env.example
+
+.DS_Store
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Terraform
+infra/terraform/.terraform/
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.backup
+infra/terraform/*.tfvars
+infra/terraform/.terraform.lock.hcl
+infra/terraform/keys/
+
+# Local git bundles produced for hand-off; not source of truth.
+*.bundle

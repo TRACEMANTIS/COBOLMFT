@@ -1,0 +1,70 @@
+---
+module: fundamentals
+order: 1
+title: Hello, world
+summary: Your first COBOL program — divisions, PROGRAM-ID, DISPLAY.
+estimatedMinutes: 10
+objectives:
+  - Recognise the four divisions of a COBOL program.
+  - Use DISPLAY to write to stdout.
+  - Run a program in the sandbox and read its output.
+assessment:
+  kind: code
+  runtime: server
+  starter: |
+    IDENTIFICATION DIVISION.
+    PROGRAM-ID. HELLO.
+    PROCEDURE DIVISION.
+        DISPLAY "GOODBYE, WORLD".
+        STOP RUN.
+  expectedOutput: HELLO, WORLD
+  hints:
+    - DISPLAY writes its argument to stdout.
+    - The string after DISPLAY must match exactly, including the comma and space.
+---
+
+# Hello, world
+
+Every COBOL program is structured as four **divisions**, in this fixed
+order:
+
+1. **IDENTIFICATION** — metadata: program name, author, date.
+2. **ENVIRONMENT** — bindings to the outside world: file assignments,
+   special-names, the configuration of the host system.
+3. **DATA** — every variable you'll touch, declared up front.
+4. **PROCEDURE** — the code that actually runs.
+
+For the smallest program possible we only need IDENTIFICATION and
+PROCEDURE.
+
+```cobol
+IDENTIFICATION DIVISION.
+PROGRAM-ID. HELLO.
+PROCEDURE DIVISION.
+    DISPLAY "HELLO, WORLD".
+    STOP RUN.
+```
+
+`DISPLAY` writes to standard output. `STOP RUN` ends the program.
+
+<Callout kind="tip" title="Free vs fixed format">
+The sample is in *free format*. Classic COBOL is *fixed format* with
+columns 1–6 reserved for sequence numbers, 7 for indicators, 8–11 for
+area A, 12–72 for area B. Most modern compilers including GnuCOBOL
+accept `--free`, which we use throughout this course.
+</Callout>
+
+The lab below is pre-loaded with a program that says the wrong thing.
+Fix it so the output is exactly `HELLO, WORLD`, then click **Run**.
+
+<CodeLab
+  lessonId="cobol/fundamentals/01-hello-world"
+  runtime="server"
+  expectedOutput="HELLO, WORLD"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. HELLO.
+PROCEDURE DIVISION.
+    DISPLAY "GOODBYE, WORLD".
+    STOP RUN.`}
+  hints={["DISPLAY writes its argument to stdout.", "Match the comma + space exactly."]}
+/>

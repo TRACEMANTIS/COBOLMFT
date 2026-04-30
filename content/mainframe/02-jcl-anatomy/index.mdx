@@ -1,0 +1,63 @@
+---
+module: fundamentals
+order: 2
+title: JCL anatomy
+summary: Read a multi-step JCL job — JOB, EXEC, DD cards, and what each one does.
+estimatedMinutes: 18
+prerequisites: [what-is-zos]
+objectives:
+  - Identify the JOB card, EXEC steps, and DD cards in a JCL deck.
+  - Sketch the step graph for a 3-step job.
+assessment:
+  kind: lab
+  lab: jcl
+  config:
+    expectedSteps: ["STEP1", "STEP2", "STEP3"]
+---
+
+# JCL anatomy
+
+Job Control Language (JCL) is z/OS's batch description format. Every
+line starts with `//`. The three card types you'll meet first:
+
+- **`//JOBNAME JOB`** — accounting, class, message routing.
+- **`//STEPNAME EXEC PGM=…`** or `EXEC PROC=…` — invoke a program or a
+  procedure.
+- **`//DDNAME DD …`** — data definition, attaching a dataset (or
+  sysout, or inline data) to a logical name the program reads.
+
+A typical 3-step job looks like:
+
+```jcl
+//PAYROLL  JOB  (ACCT),'NIGHTLY',CLASS=A,MSGCLASS=X
+//STEP1    EXEC PGM=SORTIN
+//SYSIN    DD   *
+   SORT FIELDS=(1,9,CH,A)
+/*
+//STEP2    EXEC PGM=COMPUTE
+//INFILE   DD   DSN=PAY.SORTED,DISP=SHR
+//OUTFILE  DD   DSN=PAY.RESULT,DISP=(NEW,CATLG)
+//STEP3    EXEC PGM=PRINT
+//SYSPRINT DD   SYSOUT=*
+```
+
+Three steps run sequentially: sort, compute, print. The DD cards bind
+external datasets (or in-stream data, or sysout) to the DDNAMEs the
+program opens internally.
+
+Build the JCL below so the steps are exactly **STEP1 → STEP2 → STEP3**.
+The lab parses your JCL and shows the simulated spool.
+
+<JCLLab
+  lessonId="mainframe/fundamentals/02-jcl-anatomy"
+  expectedSteps={["STEP1", "STEP2", "STEP3"]}
+  starter={`//PAYROLL  JOB  (ACCT),'NIGHTLY',CLASS=A,MSGCLASS=X
+//STEP1    EXEC PGM=SORTIN
+//SYSIN    DD   *
+   SORT FIELDS=(1,9,CH,A)
+/*
+//STEP2    EXEC PGM=COMPUTE
+//INFILE   DD   DSN=PAY.SORTED,DISP=SHR
+//OUTFILE  DD   DSN=PAY.RESULT,DISP=(NEW,CATLG)
+`}
+/>

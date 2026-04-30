@@ -1,0 +1,53 @@
+---
+module: fundamentals
+order: 1
+title: The latency budget
+summary: Where nanoseconds and microseconds come from, and how to spend them.
+estimatedMinutes: 15
+objectives:
+  - Decompose a network path into propagation, switching, NIC, and host costs.
+  - Build a budget that fits a target.
+assessment:
+  kind: lab
+  lab: latency
+  config:
+    budgetNs: 60000
+---
+
+# The latency budget
+
+Light travels about 30 cm per nanosecond in vacuum. In a single-mode
+fiber the velocity-of-propagation is about 0.67c, so signal moves at
+about 200 mm/ns — meaning a kilometre of fiber adds **~5 µs** of pure
+propagation delay. That's before you add any switches, NICs, or
+software.
+
+A useful trade tool is to write the path down as a budget and check
+whether it fits a target. For example, the round-trip-time between two
+servers in the same data hall might look like:
+
+| Component                             |     ns |
+| ------------------------------------- | -----: |
+| 30 m of fiber (×2 each way)           |    ~300 |
+| 1 cut-through switch (×2 each way)    |    ~700 |
+| Sender NIC (kernel bypass, send path) |    ~500 |
+| Receiver NIC (kernel bypass, recv)    |    ~500 |
+| Host application (round trip)         |  ~1,500 |
+
+Total: roughly 3.5 µs RTT. Out-of-budget? Adjust components.
+
+Below, design a **one-way** path that fits a 60 µs budget. You can add
+fiber, switches, NICs, host time, etc.
+
+<LatencyBudget
+  lessonId="networks/fundamentals/01-latency-budget"
+  budgetNs={60000}
+  goalDescription="Design a one-way path of 10 km of fiber + 2 switches + a NIC + host code that fits in 60 µs."
+  starter={[
+    { kind: "fiber", meters: 10000 },
+    { kind: "switch", ns: 350, mode: "cut-through" },
+    { kind: "switch", ns: 350, mode: "cut-through" },
+    { kind: "nic", ns: 800 },
+    { kind: "host", ns: 2000 },
+  ]}
+/>

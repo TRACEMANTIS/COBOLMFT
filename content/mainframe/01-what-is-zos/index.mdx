@@ -1,0 +1,65 @@
+---
+module: fundamentals
+order: 1
+title: What is z/OS?
+summary: A 60-year-old operating system that still runs the back office at most banks, insurers, and airlines.
+estimatedMinutes: 12
+objectives:
+  - Place z/OS in the System/360 → IBM Z lineage.
+  - Name three things that make it different from Linux.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: Which of these are core z/OS concepts (not Linux)?
+      multi: true
+      options:
+        - { id: a, label: "Address spaces with storage keys", correct: true }
+        - { id: b, label: "Workload Manager (WLM) goals and service classes", correct: true }
+        - { id: c, label: "fork() / exec() process model" }
+        - { id: d, label: "JES2 / JES3 spool", correct: true }
+        - { id: e, label: "ext4 file system" }
+---
+
+# What is z/OS?
+
+z/OS is the modern descendant of OS/360, first shipped in 1966. The
+machine it runs on — IBM Z — is the modern descendant of the
+System/360, first shipped in 1964. Code from the 1970s still runs.
+Architectures from the 1970s still run. That's not nostalgia; it's a
+deliberate compatibility guarantee that the back office of most banks,
+insurers, airlines, and large governments depends on.
+
+What's different from a Linux box you'd `ssh` into?
+
+- **Address spaces** instead of processes. Each unit of work has its
+  own 64-bit virtual address space, with **storage keys** that hardware
+  enforces to keep one address space's memory away from another's.
+- **Dispatcher + SRBs** instead of threads. Service Request Blocks are
+  a primitive z/OS uses for kernel-side work that doesn't belong to a
+  user task.
+- **JES2/JES3 spool** instead of `cron` + `systemd`. Batch jobs are
+  *cards* (yes, JCL still calls them cards), submitted to the spool,
+  scheduled by initiators, and their stdout/stderr live in spool
+  datasets.
+- **WLM** instead of nice/cgroups. Workload Manager classifies work
+  into *service classes* with goals (response time, percentile) and
+  schedules CPU and I/O accordingly.
+
+We'll touch each of these in later modules. First, a check.
+
+<Quiz
+  lessonId="mainframe/fundamentals/01-what-is-zos"
+  questions={[
+    {
+      prompt: "Which of these are core z/OS concepts (not Linux)?",
+      multi: true,
+      options: [
+        { id: "a", label: "Address spaces with storage keys", correct: true },
+        { id: "b", label: "Workload Manager (WLM) goals and service classes", correct: true },
+        { id: "c", label: "fork() / exec() process model" },
+        { id: "d", label: "JES2 / JES3 spool", correct: true },
+        { id: "e", label: "ext4 file system" },
+      ],
+    },
+  ]}
+/>

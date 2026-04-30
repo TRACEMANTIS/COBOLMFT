@@ -1,0 +1,59 @@
+---
+module: fundamentals
+order: 3
+title: PERFORM VARYING
+summary: COBOL's loop construct — sum 1..N with a counted PERFORM.
+estimatedMinutes: 15
+prerequisites: [hello-world, divisions]
+objectives:
+  - Declare a numeric variable with a PIC clause.
+  - Use PERFORM ... VARYING ... UNTIL to count.
+  - Read your output as a fixed-width number.
+assessment:
+  kind: code
+  runtime: server
+  starter: ""
+  expectedOutputRegex: "^SUM=0*55$"
+---
+
+# PERFORM VARYING
+
+COBOL has a single loop verb that does a lot. The most common form is
+`PERFORM ... VARYING ... UNTIL`:
+
+```cobol
+PERFORM VARYING I FROM 1 BY 1 UNTIL I > 10
+    ADD I TO TOTAL
+END-PERFORM.
+```
+
+Numeric variables need a PIC (picture) clause that declares both a type
+and a width. `PIC 9(4)` is "four numeric digits, unsigned" — the rough
+COBOL equivalent of a 4-digit unsigned decimal.
+
+Your task: write a program that sums the integers 1 through 10 and
+prints `SUM=55`. Use `DISPLAY` with a numeric edited PIC for clean
+output, or just `DISPLAY TOTAL` if you don't mind leading zeroes (the
+expected output regex accepts either).
+
+<CodeLab
+  lessonId="cobol/fundamentals/03-perform"
+  runtime="server"
+  expectedOutputRegex="^SUM=0*55$"
+  starter={`IDENTIFICATION DIVISION.
+PROGRAM-ID. SUM10.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 I       PIC 9(4).
+01 TOTAL   PIC 9(4) VALUE 0.
+PROCEDURE DIVISION.
+    PERFORM VARYING I FROM 1 BY 1 UNTIL I > 10
+        ADD I TO TOTAL
+    END-PERFORM.
+    DISPLAY "SUM=" TOTAL.
+    STOP RUN.`}
+  hints={[
+    "PIC 9(4) holds a 4-digit unsigned number.",
+    "DISPLAY can take multiple operands separated by spaces.",
+  ]}
+/>

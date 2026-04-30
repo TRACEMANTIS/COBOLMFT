@@ -1,0 +1,83 @@
+---
+module: fundamentals
+order: 3
+title: Kernel bypass
+summary: Why kernel bypass exists, and what Onload, DPDK, and RDMA do.
+estimatedMinutes: 15
+prerequisites: [latency-budget, cut-through]
+objectives:
+  - Explain what cost kernel bypass eliminates.
+  - Distinguish Onload, DPDK, and RDMA at a high level.
+assessment:
+  kind: quiz
+  questions:
+    - prompt: What single cost does kernel bypass primarily eliminate?
+      options:
+        - { id: a, label: "Cable propagation delay" }
+        - { id: b, label: "Switch buffering" }
+        - { id: c, label: "System call + interrupt + copy through the kernel network stack", correct: true, explanation: "Bypass moves the NIC ring buffers into user space and polls them, removing the syscall, interrupt, scheduler, and skb allocation." }
+        - { id: d, label: "Frame check sequence (CRC) verification" }
+    - prompt: Which of these primarily needs no application changes?
+      options:
+        - { id: a, label: "Solarflare Onload (LD_PRELOAD over Berkeley sockets)", correct: true, explanation: "Onload intercepts socket calls; the application source is unchanged." }
+        - { id: b, label: "DPDK" }
+        - { id: c, label: "RDMA verbs" }
+---
+
+# Kernel bypass
+
+The default path of a packet through Linux:
+
+1. NIC raises an interrupt.
+2. Top-half handler schedules a softirq.
+3. Softirq pulls the descriptor, allocates an `sk_buff`, runs the
+   protocol stack, queues to the socket.
+4. Application wakes, calls `recv()`, syscall, copy from kernel to
+   user space.
+
+That's micro­seconds and a lot of context switches. **Kernel bypass**
+moves the NIC's ring buffers into user space and lets the application
+poll them directly — no syscall, no interrupt, no copy.
+
+Three flavours you'll meet:
+
+- **Onload (Solarflare/AMD).** `LD_PRELOAD`-style — overrides Berkeley
+  sockets. Existing applications get bypass with no source changes.
+- **DPDK (Intel-led, vendor-neutral).** A user-space framework where
+  the application owns the NIC, drives ring buffers, and implements
+  its own protocol stack. Maximum control, maximum porting effort.
+- **RDMA (InfiniBand / RoCE / iWARP).** The NIC reads and writes the
+  remote application's memory directly. Different programming model
+  (verbs, queue pairs) but the lowest latencies for compatible
+  workloads.
+
+<Callout kind="tip" title="When NOT to use bypass">
+Bypass is strictly worse if the workload doesn't need the latency.
+You burn a CPU core polling, you trade kernel correctness for
+application correctness, and you lose anything the kernel was doing
+for you (firewall, packet capture, multi-tenancy). Reach for it when
+you have measured a real need.
+</Callout>
+
+<Quiz
+  lessonId="networks/fundamentals/03-kernel-bypass"
+  questions={[
+    {
+      prompt: "What single cost does kernel bypass primarily eliminate?",
+      options: [
+        { id: "a", label: "Cable propagation delay" },
+        { id: "b", label: "Switch buffering" },
+        { id: "c", label: "System call + interrupt + copy through the kernel network stack", correct: true, explanation: "It moves rings into user space and polls them." },
+        { id: "d", label: "Frame check sequence (CRC) verification" },
+      ],
+    },
+    {
+      prompt: "Which of these primarily needs no application changes?",
+      options: [
+        { id: "a", label: "Solarflare Onload (LD_PRELOAD over Berkeley sockets)", correct: true, explanation: "It intercepts socket calls." },
+        { id: "b", label: "DPDK" },
+        { id: "c", label: "RDMA verbs" },
+      ],
+    },
+  ]}
+/>
