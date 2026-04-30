@@ -158,7 +158,7 @@ seeded.
 
 ```bash
 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
-  ./scripts/deploy.sh --region us-east-1 --git-repo https://github.com/you/cobol-mf.git
+  ./scripts/deploy.sh --region us-east-1 --git-repo https://github.com/TRACEMANTIS/COBOLMFT.git
 ```
 
 The script provisions an EC2 host, installs Docker + nginx, brings up
